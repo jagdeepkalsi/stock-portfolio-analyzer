@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Portfolio Analyzer - AWS Lambda function with scheduled execution'
+
+Parameters:
+  S3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment package
+    Default: portfolio-analyzer-deployment
+  
+  S3Key:
+    Type: String
+    Description: S3 key for the Lambda deployment package
+    Default: lambda-deployment.zip
+  
+  EmailRecipient:
+    Type: String
+    Description: Email address to receive portfolio reports
+    Default: your-email@example.com
+
+Resources:
+  # S3 Bucket for storing portfolio data
+  PortfolioBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-portfolio-data"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Secrets for API keys and email configuration
+  ApiKeysSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: portfolio-analyzer/api-keys
+      Description: API keys for portfolio analyzer
+      SecretString: !Sub |
+        {
+          "alpha_vantage_api_key": "YOUR_ALPHA_VANTAGE_API_KEY_HERE"
+        }
+
+  EmailConfigSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: portfolio-analyzer/email-config
+      Description: Email configuration for portfolio analyzer
+      SecretString: !Sub |
+        {
+          "smtp_user": "your-email@gmail.com",
+          "smtp_password": "your-app-password"
+        }
+
+  # IAM Role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PortfolioAnalyzerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: 
+                  - !Sub "${PortfolioBucket}/*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref ApiKeysSecret
+                  - !Ref EmailConfigSecret
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  # Lambda function
+  PortfolioAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: portfolio-analyzer
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3Key
+      Timeout: 900  # 15 minutes
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref PortfolioBucket
+      Description: 'Automated portfolio analysis and reporting'
+
+  # CloudWatch Log Group
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PortfolioAnalyzerFunction}"
+      RetentionInDays: 30
+
+  # EventBridge rule for daily execution at 2 PM EST
+  DailyScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger portfolio analysis daily at 2 PM EST"
+      # Cron expression: 0 19 * * ? * (2 PM EST = 7 PM UTC during standard time, 6 PM UTC during daylight time)
+      # Using 2 PM EST year-round (adjusting for daylight saving time manually)
+      ScheduleExpression: "cron(0 19 * * ? *)"  # 2 PM EST (7 PM UTC)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PortfolioAnalyzerFunction.Arn
+          Id: "PortfolioAnalyzerTarget"
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PortfolioAnalyzerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyScheduleRule.Arn
+
+  # CloudWatch Alarm for Lambda errors
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Portfolio Analyzer Lambda function errors"
+      AlarmName: !Sub "${AWS::StackName}-lambda-errors"
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 300
+      Statistic: Sum
+      Threshold: 0
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PortfolioAnalyzerFunction
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for Lambda duration
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Portfolio Analyzer Lambda function duration"
+      AlarmName: !Sub "${AWS::StackName}-lambda-duration"
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Period: 300
+      Statistic: Average
+      Threshold: 600000  # 10 minutes in milliseconds
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PortfolioAnalyzerFunction
+      TreatMissingData: notBreaching
+
+Outputs:
+  LambdaFunctionArn:
+    Description: "Portfolio Analyzer Lambda Function ARN"
+    Value: !GetAtt PortfolioAnalyzerFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-lambda-arn"
+
+  S3BucketName:
+    Description: "S3 Bucket for portfolio data"
+    Value: !Ref PortfolioBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-s3-bucket"
+
+  ApiKeysSecretArn:
+    Description: "API Keys Secret ARN"
+    Value: !Ref ApiKeysSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-api-secret"
+
+  EmailConfigSecretArn:
+    Description: "Email Config Secret ARN"
+    Value: !Ref EmailConfigSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-email-secret"
+
+  ScheduleRuleArn:
+    Description: "Daily schedule rule ARN"
+    Value: !GetAtt DailyScheduleRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-schedule-rule"

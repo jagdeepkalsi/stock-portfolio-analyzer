@@ -1,0 +1,147 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationAccess",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:GetTemplate",
+        "cloudformation:ValidateTemplate",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:GetStackPolicy",
+        "cloudformation:SetStackPolicy"
+      ],
+      "Resource": "arn:aws:cloudformation:us-west-2:*:stack/portfolio-analyzer-stack/*"
+    },
+    {
+      "Sid": "LambdaAccess",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:AddPermission",
+        "lambda:RemovePermission",
+        "lambda:InvokeFunction",
+        "lambda:PublishVersion",
+        "lambda:ListVersionsByFunction",
+        "lambda:GetPolicy"
+      ],
+      "Resource": "arn:aws:lambda:us-west-2:*:function:portfolio-analyzer*"
+    },
+    {
+      "Sid": "S3DeploymentBucketAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::portfolio-analyzer-deployment-jagdeep",
+        "arn:aws:s3:::portfolio-analyzer-deployment-jagdeep/*"
+      ]
+    },
+    {
+      "Sid": "S3DataBucketManagement",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:PutBucketVersioning",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:GetBucketVersioning",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::portfolio-analyzer-stack-portfolio-data*"
+    },
+    {
+      "Sid": "S3DataBucketObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::portfolio-analyzer-stack-portfolio-data*/*"
+    },
+    {
+      "Sid": "IAMRoleManagement",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListRolePolicies",
+        "iam:UpdateAssumeRolePolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/portfolio-analyzer-stack-LambdaExecutionRole*",
+        "arn:aws:iam::*:role/LambdaExecutionRole*"
+      ]
+    },
+    {
+      "Sid": "SecretsManagerAccess",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:UpdateSecret",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:TagResource"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-west-2:*:secret:portfolio-analyzer/*"
+    },
+    {
+      "Sid": "CloudWatchLogsAccess",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:DescribeLogGroups",
+        "logs:DeleteLogGroup",
+        "logs:TagLogGroup"
+      ],
+      "Resource": "arn:aws:logs:us-west-2:*:log-group:/aws/lambda/portfolio-analyzer*"
+    },
+    {
+      "Sid": "CloudWatchAlarmsAccess",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:DeleteAlarms"
+      ],
+      "Resource": "arn:aws:cloudwatch:us-west-2:*:alarm:portfolio-analyzer-*"
+    },
+    {
+      "Sid": "EventBridgeAccess",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule",
+        "events:PutTargets",
+        "events:DescribeRule",
+        "events:RemoveTargets",
+        "events:DeleteRule",
+        "events:ListTargetsByRule"
+      ],
+      "Resource": "arn:aws:events:us-west-2:*:rule/portfolio-analyzer-stack-DailyScheduleRule*"
+    }
+  ]
+}

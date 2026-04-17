@@ -1,0 +1,30 @@
+{
+    "accounts": {
+        "Fidelity_401k": {
+            "account_type": "401k",
+            "holdings": {
+                "AAPL": {
+                    "shares": 10,
+                    "purchase_price": 150.00
+                },
+                "MSFT": {
+                    "shares": 8,
+                    "purchase_price": 300.00
+                }
+            }
+        },
+        "Schwab_Brokerage": {
+            "account_type": "brokerage",
+            "holdings": {
+                "GOOGL": {
+                    "shares": 5,
+                    "purchase_price": 2500.00
+                },
+                "TSLA": {
+                    "shares": 3,
+                    "purchase_price": 800.00
+                }
+            }
+        }
+    }
+}
