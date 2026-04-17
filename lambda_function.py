@@ -5,17 +5,19 @@ Fetches stock prices and generates daily portfolio summaries
 """
 
 import json
+import os
 import pandas as pd
 from datetime import datetime
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import requests
 import time
 import boto3
 import logging
 from botocore.exceptions import ClientError
 import io
+
+from data_providers import get_provider
 
 # Configure logging
 logger = logging.getLogger()
@@ -30,6 +32,7 @@ class LambdaPortfolioAnalyzer:
         self.smtp_user = None
         self.smtp_password = None
         self.portfolio_config = None
+        self.data_provider = None
         
     def get_secret(self, secret_name):
         """Retrieve secret from AWS Secrets Manager"""
@@ -52,21 +55,29 @@ class LambdaPortfolioAnalyzer:
     def initialize_credentials(self):
         """Initialize API keys and configuration from AWS services"""
         try:
-            # Get secrets from Secrets Manager
-            api_secrets = self.get_secret('portfolio-analyzer/api-keys')
+            provider_name = os.environ.get('DATA_PROVIDER', 'yfinance').lower()
+
+            # Alpha Vantage key is only needed when explicitly selected
+            if provider_name == 'alpha_vantage':
+                api_secrets = self.get_secret('portfolio-analyzer/api-keys')
+                self.alpha_vantage_key = api_secrets.get('alpha_vantage_api_key')
+                logger.info("Alpha Vantage API key loaded from Secrets Manager")
+
+            # Email credentials are always required
             email_secrets = self.get_secret('portfolio-analyzer/email-config')
-            
-            self.alpha_vantage_key = api_secrets['alpha_vantage_api_key']
             self.smtp_user = email_secrets['smtp_user']
             self.smtp_password = email_secrets['smtp_password']
-            
-            # Get bucket name from environment variable
+
+            # S3 bucket from environment
             self.bucket_name = os.environ.get('S3_BUCKET_NAME')
             if not self.bucket_name:
                 raise ValueError("S3_BUCKET_NAME environment variable not set")
-            
+
+            # Initialise the data provider
+            self.data_provider = get_provider(provider_name, self.alpha_vantage_key)
+            logger.info(f"Data provider set to: {provider_name}")
             logger.info("Successfully initialized credentials")
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize credentials: {e}")
             raise
@@ -118,87 +129,9 @@ class LambdaPortfolioAnalyzer:
             logger.error(f"Failed to load holdings: {e}")
             raise
     
-    def get_benchmark_data(self, symbol):
-        """Fetch benchmark data (SPY for S&P 500, QQQ for NASDAQ)"""
-        return self.get_stock_data(symbol)
-    
     def get_stock_data(self, symbol):
-        """Fetch stock data and company info using Alpha Vantage API"""
-        if not self.alpha_vantage_key:
-            raise ValueError("Alpha Vantage API key not available")
-            
-        try:
-            # First get quote data
-            quote_url = f"https://www.alphavantage.co/query"
-            quote_params = {
-                'function': 'GLOBAL_QUOTE',
-                'symbol': symbol,
-                'apikey': self.alpha_vantage_key
-            }
-            
-            response = requests.get(quote_url, params=quote_params, timeout=10)
-            data = response.json()
-            
-            # Check for API errors
-            if 'Error Message' in data:
-                logger.error(f"Alpha Vantage error for {symbol}: {data['Error Message']}")
-                return None
-                
-            if 'Note' in data:
-                logger.warning(f"Alpha Vantage rate limit for {symbol}: {data['Note']}")
-                return None
-            
-            # Extract quote data
-            quote = data.get('Global Quote', {})
-            if not quote:
-                logger.warning(f"No quote data found for {symbol}")
-                return None
-            
-            current_price = float(quote.get('05. price', 0))
-            prev_close = float(quote.get('08. previous close', 0))
-            volume = int(quote.get('06. volume', 0))
-            
-            # Get company overview for sector info
-            sector = "Unknown"
-            company_name = symbol
-            
-            try:
-                time.sleep(0.2)  # Rate limiting between API calls
-                overview_params = {
-                    'function': 'OVERVIEW',
-                    'symbol': symbol,
-                    'apikey': self.alpha_vantage_key
-                }
-                
-                overview_response = requests.get(quote_url, params=overview_params, timeout=10)
-                overview_data = overview_response.json()
-                
-                if overview_data and 'Sector' in overview_data:
-                    sector = overview_data.get('Sector', 'Unknown')
-                    company_name = overview_data.get('Name', symbol)
-            except Exception as e:
-                logger.warning(f"Failed to get overview data for {symbol}: {e}")
-            
-            return {
-                'symbol': symbol,
-                'current_price': current_price,
-                'previous_close': prev_close,
-                'change': current_price - prev_close,
-                'change_percent': ((current_price - prev_close) / prev_close) * 100 if prev_close else 0,
-                'volume': volume,
-                'company_name': company_name,
-                'sector': sector
-            }
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error fetching data for {symbol}: {e}")
-            return None
-        except (KeyError, ValueError, TypeError) as e:
-            logger.error(f"Data parsing error for {symbol}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error fetching data for {symbol}: {e}")
-            return None
+        """Fetch stock data via the configured data provider."""
+        return self.data_provider.get_stock_data(symbol)
     
     def analyze_portfolio(self, holdings):
         """Analyze the entire portfolio across all accounts with enhanced metrics"""
@@ -213,7 +146,6 @@ class LambdaPortfolioAnalyzer:
             for symbol, holdings_data in account_info.get('holdings', {}).items():
                 logger.info(f"Fetching data for {symbol}")
                 stock_data = self.get_stock_data(symbol)
-                time.sleep(0.4)  # Rate limiting for Alpha Vantage
                 
                 if stock_data:
                     shares = holdings_data['shares']
@@ -261,7 +193,7 @@ class LambdaPortfolioAnalyzer:
         
         try:
             # S&P 500 (SPY)
-            spy_data = self.get_benchmark_data('SPY')
+            spy_data = self.get_stock_data('SPY')
             if spy_data:
                 benchmarks['S&P 500'] = {
                     'symbol': 'SPY',
@@ -269,10 +201,8 @@ class LambdaPortfolioAnalyzer:
                     'daily_change_percent': spy_data['change_percent']
                 }
             
-            time.sleep(0.2)  # Rate limiting
-            
             # NASDAQ (QQQ)
-            qqq_data = self.get_benchmark_data('QQQ')
+            qqq_data = self.get_stock_data('QQQ')
             if qqq_data:
                 benchmarks['NASDAQ'] = {
                     'symbol': 'QQQ', 

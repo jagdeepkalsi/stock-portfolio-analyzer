@@ -75,8 +75,8 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:PutObject
-                Resource: 
-                  - !Sub "${PortfolioBucket}/*"
+                Resource:
+                  - !Sub "arn:aws:s3:::${PortfolioBucket}/*"
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue

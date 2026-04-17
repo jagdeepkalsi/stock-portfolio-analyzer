@@ -1,3 +1,9 @@
 .DS_Store
 build/
 portfolio_analyzer/
+
+# Sensitive portfolio data - never commit these
+holdings.csv
+portfolio.json
+.env
+lambda-deployment.zip

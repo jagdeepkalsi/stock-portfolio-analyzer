@@ -11,9 +11,10 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
-import requests
 import time
 from dotenv import load_dotenv
+
+from data_providers import get_provider
 
 load_dotenv()
 
@@ -22,9 +23,11 @@ class PortfolioAnalyzer:
         self.portfolio_file = portfolio_file
         self.portfolio = self.load_portfolio()
         self.holdings = self.load_holdings()
-        self.alpha_vantage_key = os.getenv('ALPHA_VANTAGE_API_KEY')
-        if not self.alpha_vantage_key:
-            print("Warning: ALPHA_VANTAGE_API_KEY not found in environment variables")
+
+        provider_name = os.getenv('DATA_PROVIDER', 'yfinance')
+        alpha_vantage_key = os.getenv('ALPHA_VANTAGE_API_KEY')  # only used if provider is alpha_vantage
+        self.data_provider = get_provider(provider_name, alpha_vantage_key)
+        print(f"Using data provider: {provider_name}")
     
     def load_portfolio(self):
         """Load portfolio configuration from JSON file"""
@@ -120,89 +123,9 @@ class PortfolioAnalyzer:
             }
         }
     
-    def get_benchmark_data(self, symbol):
-        """Fetch benchmark data (SPY for S&P 500, QQQ for NASDAQ)"""
-        return self.get_stock_data(symbol)
-    
     def get_stock_data(self, symbol):
-        """Fetch stock data and company info using Alpha Vantage API"""
-        if not self.alpha_vantage_key:
-            print(f"No API key found, cannot fetch data for {symbol}")
-            return None
-            
-        try:
-            # First get quote data
-            quote_url = f"https://www.alphavantage.co/query"
-            quote_params = {
-                'function': 'GLOBAL_QUOTE',
-                'symbol': symbol,
-                'apikey': self.alpha_vantage_key
-            }
-            
-            response = requests.get(quote_url, params=quote_params, timeout=10)
-            data = response.json()
-            
-            # Check for API errors
-            if 'Error Message' in data:
-                print(f"Alpha Vantage error for {symbol}: {data['Error Message']}")
-                return None
-                
-            if 'Note' in data:
-                print(f"Alpha Vantage rate limit for {symbol}: {data['Note']}")
-                return None
-            
-            # Extract quote data
-            quote = data.get('Global Quote', {})
-            if not quote:
-                print(f"No quote data found for {symbol} - API response: {data}")
-                return None
-            
-            current_price = float(quote.get('05. price', 0))
-            prev_close = float(quote.get('08. previous close', 0))
-            volume = int(quote.get('06. volume', 0))
-            
-            # Get company overview for sector info
-            sector = "Unknown"
-            company_name = symbol
-            
-            try:
-                time.sleep(0.2)  # Rate limiting between API calls
-                overview_params = {
-                    'function': 'OVERVIEW',
-                    'symbol': symbol,
-                    'apikey': self.alpha_vantage_key
-                }
-                
-                overview_response = requests.get(quote_url, params=overview_params, timeout=10)
-                overview_data = overview_response.json()
-                
-                if overview_data and 'Sector' in overview_data:
-                    sector = overview_data.get('Sector', 'Unknown')
-                    company_name = overview_data.get('Name', symbol)
-            except:
-                # If overview fails, continue with basic data
-                pass
-            
-            return {
-                'symbol': symbol,
-                'current_price': current_price,
-                'previous_close': prev_close,
-                'change': current_price - prev_close,
-                'change_percent': ((current_price - prev_close) / prev_close) * 100 if prev_close else 0,
-                'volume': volume,
-                'company_name': company_name,
-                'sector': sector
-            }
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Network error fetching data for {symbol}: {e}")
-            return None
-        except (KeyError, ValueError, TypeError) as e:
-            print(f"Data parsing error for {symbol}: {e}")
-            return None
-        except Exception as e:
-            print(f"Unexpected error fetching data for {symbol}: {e}")
-            return None
+        """Fetch stock data via the configured data provider."""
+        return self.data_provider.get_stock_data(symbol)
     
     def analyze_portfolio(self):
         """Analyze the entire portfolio across all accounts with enhanced metrics"""
@@ -214,7 +137,6 @@ class PortfolioAnalyzer:
         for account_name, account_info in self.holdings.get('accounts', {}).items():
             for symbol, holdings in account_info.get('holdings', {}).items():
                 stock_data = self.get_stock_data(symbol)
-                time.sleep(0.4)  # Increased rate limiting for multiple API calls
                 if stock_data:
                     shares = holdings['shares']
                     purchase_price = holdings['purchase_price']
@@ -258,7 +180,7 @@ class PortfolioAnalyzer:
         benchmarks = {}
         
         # S&P 500 (SPY)
-        spy_data = self.get_benchmark_data('SPY')
+        spy_data = self.get_stock_data('SPY')
         if spy_data:
             benchmarks['S&P 500'] = {
                 'symbol': 'SPY',
@@ -266,10 +188,8 @@ class PortfolioAnalyzer:
                 'daily_change_percent': spy_data['change_percent']
             }
         
-        time.sleep(0.2)  # Rate limiting
-        
         # NASDAQ (QQQ)
-        qqq_data = self.get_benchmark_data('QQQ')
+        qqq_data = self.get_stock_data('QQQ')
         if qqq_data:
             benchmarks['NASDAQ'] = {
                 'symbol': 'QQQ', 
