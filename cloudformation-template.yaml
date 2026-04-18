@@ -39,7 +39,8 @@ Resources:
       Description: API keys for portfolio analyzer
       SecretString: !Sub |
         {
-          "alpha_vantage_api_key": "YOUR_ALPHA_VANTAGE_API_KEY_HERE"
+          "alpha_vantage_api_key": "YOUR_ALPHA_VANTAGE_API_KEY_HERE",
+          "finnhub_api_key": "YOUR_FINNHUB_API_KEY_HERE"
         }
 
   EmailConfigSecret:
@@ -173,12 +174,64 @@ Resources:
           Value: !Ref PortfolioAnalyzerFunction
       TreatMissingData: notBreaching
 
+  # News alert Lambda function (same zip, separate handler + schedule)
+  NewsAlertFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: portfolio-news-alert
+      Runtime: python3.11
+      Handler: lambda_function.news_alert_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3Key
+      Timeout: 300   # 5 minutes — news fetching is faster than full portfolio analysis
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref PortfolioBucket
+          DATA_PROVIDER: finnhub
+      Description: 'Pre-market news alert digest'
+
+  # CloudWatch Log Group for news alert
+  NewsAlertLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${NewsAlertFunction}"
+      RetentionInDays: 30
+
+  # EventBridge rule: 7:30 AM ET weekdays (12:30 UTC = EST, shifts to 11:30 UTC during EDT)
+  NewsAlertScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger pre-market news alert at 7:30 AM ET on weekdays"
+      ScheduleExpression: "cron(30 12 ? * MON-FRI *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NewsAlertFunction.Arn
+          Id: "NewsAlertTarget"
+
+  # Permission for EventBridge to invoke news alert Lambda
+  NewsAlertInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NewsAlertFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NewsAlertScheduleRule.Arn
+
 Outputs:
   LambdaFunctionArn:
     Description: "Portfolio Analyzer Lambda Function ARN"
     Value: !GetAtt PortfolioAnalyzerFunction.Arn
     Export:
       Name: !Sub "${AWS::StackName}-lambda-arn"
+
+  NewsAlertFunctionArn:
+    Description: "News Alert Lambda Function ARN"
+    Value: !GetAtt NewsAlertFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-news-alert-lambda-arn"
 
   S3BucketName:
     Description: "S3 Bucket for portfolio data"
@@ -201,5 +254,9 @@ Outputs:
   ScheduleRuleArn:
     Description: "Daily schedule rule ARN"
     Value: !GetAtt DailyScheduleRule.Arn
+
+  NewsAlertScheduleRuleArn:
+    Description: "News alert schedule rule ARN"
+    Value: !GetAtt NewsAlertScheduleRule.Arn
     Export:
       Name: !Sub "${AWS::StackName}-schedule-rule"
