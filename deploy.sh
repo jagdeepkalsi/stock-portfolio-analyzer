@@ -16,8 +16,12 @@ echo "📦 Creating deployment package..."
 rm -rf build/
 mkdir -p build/
 
-# Copy Lambda function
+# Copy Lambda function and supporting modules
 cp lambda_function.py build/
+cp data_providers.py build/
+cp news_providers.py build/
+cp news_scorer.py build/
+cp news_alert.py build/
 
 # Install dependencies
 echo "📚 Installing Python dependencies..."
@@ -44,10 +48,18 @@ aws cloudformation deploy \
     --capabilities CAPABILITY_IAM \
     --region $REGION
 
-# Update Lambda function code
+# Update Lambda function code (portfolio analyzer)
 echo "🔄 Updating Lambda function code..."
 aws lambda update-function-code \
     --function-name $FUNCTION_NAME \
+    --s3-bucket $S3_BUCKET \
+    --s3-key lambda-deployment.zip \
+    --region $REGION
+
+# Update news alert Lambda function code
+echo "🔄 Updating news alert Lambda function code..."
+aws lambda update-function-code \
+    --function-name portfolio-news-alert \
     --s3-bucket $S3_BUCKET \
     --s3-key lambda-deployment.zip \
     --region $REGION
@@ -56,11 +68,14 @@ echo "✅ Deployment completed successfully!"
 echo ""
 echo "📋 Next steps:"
 echo "1. Update the secrets in AWS Secrets Manager:"
-echo "   - portfolio-analyzer/api-keys"
+echo "   - portfolio-analyzer/api-keys  (add finnhub_api_key)"
 echo "   - portfolio-analyzer/email-config"
 echo "2. Upload your holdings.csv and portfolio.json to S3 bucket"
-echo "3. Test the Lambda function"
+echo "3. Enable news alerts in portfolio.json: settings.news_alerts.enabled = true"
+echo "4. Test both Lambda functions"
 echo ""
 echo "🔗 Useful commands:"
 echo "aws lambda invoke --function-name $FUNCTION_NAME response.json && cat response.json"
+echo "aws lambda invoke --function-name portfolio-news-alert news-response.json && cat news-response.json"
 echo "aws logs tail /aws/lambda/$FUNCTION_NAME --follow"
+echo "aws logs tail /aws/lambda/portfolio-news-alert --follow"

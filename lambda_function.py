@@ -630,12 +630,183 @@ def lambda_handler(event, context):
         
     except Exception as e:
         logger.error(f"Portfolio analysis failed: {str(e)}", exc_info=True)
-        
+
         return {
             'statusCode': 500,
             'body': json.dumps({
                 'error': 'Portfolio analysis failed',
                 'message': str(e),
                 'timestamp': start_time.isoformat()
+            })
+        }
+
+
+# ---------------------------------------------------------------------------
+# News alert Lambda handler
+# ---------------------------------------------------------------------------
+
+class LambdaNewsAlertGenerator:
+    """
+    Lambda version of NewsAlertGenerator.
+    Reuses LambdaPortfolioAnalyzer's credential/S3/SMTP infrastructure,
+    delegating all news-specific logic to the modules in news_alert.py,
+    news_providers.py, and news_scorer.py.
+    """
+
+    def __init__(self):
+        # Reuse the same portfolio analyzer for credential + config loading
+        self._analyzer = LambdaPortfolioAnalyzer()
+        self.news_cfg  = None
+        self.symbol_map = {}   # {symbol: symbol} — names resolved from news feed
+
+    def initialize(self):
+        """Load credentials, config, and holdings from AWS services."""
+        self._analyzer.initialize_credentials()
+        self._analyzer.load_portfolio_config()
+        holdings = self._analyzer.load_holdings()
+
+        # Extract unique symbols from loaded holdings
+        for account_info in holdings.get('accounts', {}).values():
+            for symbol in account_info.get('holdings', {}).keys():
+                self.symbol_map[symbol.upper()] = symbol.upper()
+
+        # Merge news config
+        from news_alert import DEFAULT_NEWS_CONFIG
+        cfg = {**DEFAULT_NEWS_CONFIG}
+        user_cfg = self._analyzer.portfolio_config.get('settings', {}).get('news_alerts', {})
+        cfg.update(user_cfg)
+        self.news_cfg = cfg
+
+    def run(self) -> dict:
+        """
+        Fetch, score, build, and email the news digest.
+        Returns a summary dict for the Lambda response body.
+        """
+        from news_providers import get_news_provider
+        from news_scorer import NewsDeduplicator, NewsScorer
+        from news_alert import NewsAlertGenerator, render_email_html
+
+        # Build a local-style generator but override provider + credentials
+        finnhub_key = self._analyzer.finnhub_key if hasattr(self._analyzer, 'finnhub_key') else None
+
+        # Retrieve finnhub_key from secrets if not already on the analyzer
+        if not finnhub_key:
+            try:
+                api_secrets = self._analyzer.get_secret('portfolio-analyzer/api-keys')
+                finnhub_key = api_secrets.get('finnhub_api_key')
+            except Exception as e:
+                logger.error(f"Could not retrieve Finnhub API key: {e}")
+                raise
+
+        provider = get_news_provider('finnhub', finnhub_key=finnhub_key)
+        scorer   = NewsScorer(self.news_cfg)
+        deduper  = NewsDeduplicator(window_hours=self.news_cfg.get('dedup_window_hours', 24))
+
+        # Build a minimal generator-like object to reuse fetch/score/build logic
+        from news_alert import NewsAlertGenerator as _Gen
+        gen = object.__new__(_Gen)
+        gen.portfolio     = self._analyzer.portfolio_config
+        gen.symbol_map    = self.symbol_map
+        gen.news_cfg      = self.news_cfg
+        gen.provider      = provider
+        gen.scorer        = scorer
+        gen.deduper       = deduper
+
+        lookback = self.news_cfg.get('lookback_days', 1)
+        raw      = gen.fetch_all_news(lookback_days=lookback)
+        scored   = gen.score_and_rank_news(raw)
+        digest   = gen.build_digest_data(scored)
+        html     = render_email_html(digest)
+
+        if self.news_cfg.get('send_email', True):
+            self._send_email(html, digest.get('generated_at_display', ''))
+
+        return {
+            'articles_shown':     digest['stats']['articles_shown'],
+            'high_impact_symbols': digest['high_impact_symbols'],
+        }
+
+    def _send_email(self, html: str, generated_at: str):
+        """Send news digest via SMTP using credentials loaded from Secrets Manager."""
+        try:
+            email_settings = self._analyzer.portfolio_config.get('settings', {}).get('email_settings', {})
+            recipient      = email_settings.get('recipient')
+
+            if not recipient or recipient == 'your-email@example.com':
+                logger.warning("Email recipient not configured — skipping news digest email")
+                return
+
+            msg = MIMEMultipart('alternative')
+            msg['From']    = self._analyzer.smtp_user
+            msg['To']      = recipient
+            msg['Subject'] = f"[Pre-Market Alert] Portfolio News Digest - {datetime.now().strftime('%B %d, %Y')}"
+
+            msg.attach(MIMEText("Portfolio news digest — view in an HTML-capable client.", 'plain'))
+            msg.attach(MIMEText(html, 'html'))
+
+            server = smtplib.SMTP(
+                email_settings.get('smtp_server', 'smtp.gmail.com'),
+                email_settings.get('smtp_port', 587),
+            )
+            server.starttls()
+            server.login(self._analyzer.smtp_user, self._analyzer.smtp_password)
+            server.send_message(msg)
+            server.quit()
+            logger.info(f"News digest email sent to {recipient}")
+
+        except Exception as e:
+            logger.error(f"Failed to send news digest email: {e}")
+            raise
+
+
+def news_alert_handler(event, context):
+    """
+    AWS Lambda handler for the pre-market news alert.
+
+    Triggered by EventBridge on a separate schedule from lambda_handler
+    (typically 7:30 AM ET weekdays: cron(30 12 ? * MON-FRI *)).
+    """
+    start_time = datetime.now()
+    logger.info(f"News alert handler started at {start_time.isoformat()}")
+
+    try:
+        generator = LambdaNewsAlertGenerator()
+        generator.initialize()
+
+        if not generator.news_cfg.get('enabled', False):
+            logger.info("News alerts disabled in portfolio.json — exiting")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message': 'News alerts disabled in portfolio config',
+                    'timestamp': start_time.isoformat(),
+                })
+            }
+
+        result = generator.run()
+
+        end_time       = datetime.now()
+        execution_time = (end_time - start_time).total_seconds()
+        logger.info(f"News alert completed in {execution_time:.2f}s — {result}")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message':             'News alert completed successfully',
+                'timestamp':           start_time.isoformat(),
+                'execution_time_seconds': execution_time,
+                'articles_shown':      result.get('articles_shown', 0),
+                'high_impact_symbols': result.get('high_impact_symbols', []),
+            })
+        }
+
+    except Exception as e:
+        logger.error(f"News alert failed: {str(e)}", exc_info=True)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error':     'News alert failed',
+                'message':   str(e),
+                'timestamp': start_time.isoformat(),
             })
         }

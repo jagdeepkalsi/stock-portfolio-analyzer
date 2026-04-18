@@ -53,6 +53,18 @@ class PortfolioAnalyzer:
                     "recipient": "your-email@example.com",
                     "smtp_server": "smtp.gmail.com",
                     "smtp_port": 587
+                },
+                "news_alerts": {
+                    "enabled": False,
+                    "send_email": True,
+                    "lookback_days": 1,
+                    "min_score_threshold": 3,
+                    "max_articles_per_symbol": 5,
+                    "max_market_articles": 10,
+                    "dedup_window_hours": 24,
+                    "include_market_news": True,
+                    "market_news_categories": ["general", "merger"],
+                    "keyword_overrides": {}
                 }
             }
         }
