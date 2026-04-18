@@ -10,6 +10,7 @@ NewsDeduplicator: Removes duplicate articles across company and market feeds
 """
 
 import time
+from urllib.parse import urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +212,17 @@ class NewsScorer:
         if article.get('portfolio_impact'):
             total += 3
 
+        # Layer 5: Alpha Vantage sentiment bonus
+        av_score = article.get('av_sentiment_score', 0.0)
+        if abs(av_score) >= 0.15:   # threshold: Somewhat Bullish / Somewhat Bearish
+            total += 2
+
         return min(total, 100)
 
     def extract_impact_tags(self, article: dict) -> list:
         """
         Return a list of human-readable impact label strings for the article.
-        E.g. ["EARNINGS BEAT", "GUIDANCE UP"]
+        E.g. ["EARNINGS BEAT", "GUIDANCE UP", "BULLISH"]
         """
         text = (
             article.get('headline', '') + ' ' + article.get('summary', '')
@@ -228,6 +234,14 @@ class NewsScorer:
                 if kw in text:
                     tags.append(tag)
                     break
+
+        # Alpha Vantage sentiment tags (added regardless of keyword matches)
+        av_score = article.get('av_sentiment_score', 0.0)
+        if av_score >= 0.15:
+            tags.append('BULLISH')
+        elif av_score <= -0.15:
+            tags.append('BEARISH')
+
         return tags
 
     def tag_portfolio_impact(self, article: dict, portfolio_symbols: set) -> list:
@@ -278,13 +292,19 @@ class NewsDeduplicator:
 
     def __init__(self, window_hours: int = 24):
         self.window_hours = window_hours
-        self._seen_ids: set = set()
+        self._seen_ids:       set  = set()
+        self._seen_urls:      set  = set()   # normalized URL dedup (cross-provider)
         self._seen_headlines: list = []
+        self.stats = {'id': 0, 'url': 0, 'jaccard': 0, 'old': 0}
 
     def filter(self, articles: list) -> list:
         """
-        Accept a flat list of articles (already time-window filtered).
-        Return deduplicated list preserving original order.
+        Accept a flat list of articles. Return deduplicated list preserving order.
+
+        Three dedup layers (first occurrence wins):
+          1. Exact article ID  — same Finnhub/AV id seen twice
+          2. Normalized URL    — same story on different domains (strips query params)
+          3. Headline Jaccard  — near-identical headline (≥ 0.70), catches wire reformats
         """
         result = []
         cutoff = time.time() - (self.window_hours * 3600)
@@ -292,26 +312,48 @@ class NewsDeduplicator:
         for article in articles:
             # Drop articles older than the dedup window
             if article.get('datetime', 0) < cutoff:
+                self.stats['old'] += 1
                 continue
 
             article_id = article.get('id')
+            url        = article.get('url', '')
             headline   = article.get('headline', '')
+            norm_url   = self._normalize_url(url)
 
             # Level 1: exact id dedup
             if article_id and article_id in self._seen_ids:
+                self.stats['id'] += 1
                 continue
 
-            # Level 2: headline similarity dedup
+            # Level 2: normalized URL dedup
+            if norm_url and norm_url in self._seen_urls:
+                self.stats['url'] += 1
+                continue
+
+            # Level 3: headline similarity dedup
             if any(self._jaccard(headline, seen) >= 0.7 for seen in self._seen_headlines):
+                self.stats['jaccard'] += 1
                 continue
 
             # Accept this article
             if article_id:
                 self._seen_ids.add(article_id)
+            if norm_url:
+                self._seen_urls.add(norm_url)
             self._seen_headlines.append(headline)
             result.append(article)
 
         return result
+
+    def _normalize_url(self, url: str) -> str:
+        """Strip query params and fragment; return 'netloc/path' for comparison."""
+        if not url:
+            return ''
+        try:
+            p = urlparse(url)
+            return f"{p.netloc}{p.path}".rstrip('/')
+        except Exception:
+            return ''
 
     def _jaccard(self, a: str, b: str) -> float:
         """Token-level Jaccard similarity. No external libraries."""
