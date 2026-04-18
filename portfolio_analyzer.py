@@ -24,9 +24,14 @@ class PortfolioAnalyzer:
         self.portfolio = self.load_portfolio()
         self.holdings = self.load_holdings()
 
-        provider_name = os.getenv('DATA_PROVIDER', 'yfinance')
-        alpha_vantage_key = os.getenv('ALPHA_VANTAGE_API_KEY')  # only used if provider is alpha_vantage
-        self.data_provider = get_provider(provider_name, alpha_vantage_key)
+        provider_name     = os.getenv('DATA_PROVIDER', 'finnhub')
+        finnhub_key       = os.getenv('FINNHUB_API_KEY')
+        alpha_vantage_key = os.getenv('ALPHA_VANTAGE_API_KEY')
+        self.data_provider = get_provider(
+            provider_name,
+            alpha_vantage_key=alpha_vantage_key,
+            finnhub_key=finnhub_key,
+        )
         print(f"Using data provider: {provider_name}")
     
     def load_portfolio(self):
@@ -58,36 +63,53 @@ class PortfolioAnalyzer:
         return sample_portfolio
     
     def load_holdings(self):
-        """Load holdings from CSV file"""
+        """Load holdings from CSV file.
+
+        Multiple rows for the same symbol in the same account (e.g. RSU lots
+        with different vest prices) are merged into a single position using
+        total shares and a weighted-average purchase price.
+        """
         holdings_file = self.portfolio.get('settings', {}).get('holdings_file', 'holdings.csv')
         try:
             df = pd.read_csv(holdings_file)
-            
-            # Convert CSV to nested structure for compatibility
+
             holdings = {"accounts": {}}
-            
+
             for _, row in df.iterrows():
-                account_name = row['account_name']
-                account_type = row['account_type']
-                symbol = row['symbol']
-                shares = row['shares']
-                purchase_price = row['purchase_price']
-                purchase_date = row.get('purchase_date', '')
-                
+                account_name   = row['account_name']
+                account_type   = row['account_type']
+                symbol         = row['symbol']
+                shares         = float(row['shares'])
+                purchase_price = float(row['purchase_price'])
+                purchase_date  = row.get('purchase_date', '')
+
                 if account_name not in holdings["accounts"]:
                     holdings["accounts"][account_name] = {
                         "account_type": account_type,
                         "holdings": {}
                     }
-                
-                holdings["accounts"][account_name]["holdings"][symbol] = {
-                    "shares": shares,
-                    "purchase_price": purchase_price,
-                    "purchase_date": purchase_date
-                }
-            
+
+                acct_holdings = holdings["accounts"][account_name]["holdings"]
+
+                if symbol not in acct_holdings:
+                    acct_holdings[symbol] = {
+                        "shares": shares,
+                        "purchase_price": purchase_price,
+                        "purchase_date": purchase_date
+                    }
+                else:
+                    # Merge lot: accumulate shares, recalculate weighted avg cost
+                    existing = acct_holdings[symbol]
+                    total_shares = existing["shares"] + shares
+                    weighted_avg_price = (
+                        (existing["shares"] * existing["purchase_price"]) +
+                        (shares * purchase_price)
+                    ) / total_shares
+                    existing["shares"] = total_shares
+                    existing["purchase_price"] = round(weighted_avg_price, 4)
+
             return holdings
-            
+
         except FileNotFoundError:
             print(f"Holdings file {holdings_file} not found. Creating sample holdings.")
             return self.create_sample_holdings(holdings_file)

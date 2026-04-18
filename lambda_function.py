@@ -55,17 +55,26 @@ class LambdaPortfolioAnalyzer:
     def initialize_credentials(self):
         """Initialize API keys and configuration from AWS services"""
         try:
-            provider_name = os.environ.get('DATA_PROVIDER', 'yfinance').lower()
+            provider_name    = os.environ.get('DATA_PROVIDER', 'finnhub').lower()
+            finnhub_key      = None
+            alpha_vantage_key = None
 
-            # Alpha Vantage key is only needed when explicitly selected
-            if provider_name == 'alpha_vantage':
+            # Load the API key for whichever provider is selected
+            if provider_name == 'finnhub':
                 api_secrets = self.get_secret('portfolio-analyzer/api-keys')
-                self.alpha_vantage_key = api_secrets.get('alpha_vantage_api_key')
+                finnhub_key = api_secrets.get('finnhub_api_key')
+                logger.info("Finnhub API key loaded from Secrets Manager")
+
+            elif provider_name == 'alpha_vantage':
+                api_secrets       = self.get_secret('portfolio-analyzer/api-keys')
+                alpha_vantage_key = api_secrets.get('alpha_vantage_api_key')
                 logger.info("Alpha Vantage API key loaded from Secrets Manager")
+
+            # yfinance needs no key — nothing to load
 
             # Email credentials are always required
             email_secrets = self.get_secret('portfolio-analyzer/email-config')
-            self.smtp_user = email_secrets['smtp_user']
+            self.smtp_user     = email_secrets['smtp_user']
             self.smtp_password = email_secrets['smtp_password']
 
             # S3 bucket from environment
@@ -74,7 +83,11 @@ class LambdaPortfolioAnalyzer:
                 raise ValueError("S3_BUCKET_NAME environment variable not set")
 
             # Initialise the data provider
-            self.data_provider = get_provider(provider_name, self.alpha_vantage_key)
+            self.data_provider = get_provider(
+                provider_name,
+                alpha_vantage_key=alpha_vantage_key,
+                finnhub_key=finnhub_key,
+            )
             logger.info(f"Data provider set to: {provider_name}")
             logger.info("Successfully initialized credentials")
 
@@ -94,37 +107,58 @@ class LambdaPortfolioAnalyzer:
             raise
     
     def load_holdings(self):
-        """Load holdings from S3 CSV file"""
+        """Load holdings from S3 CSV file.
+
+        Multiple rows for the same symbol in the same account (e.g. RSU lots
+        with different vest prices) are merged into a single position using
+        total shares and a weighted-average purchase price.
+        """
         try:
             csv_data = self.get_s3_object(self.bucket_name, 'holdings.csv')
             df = pd.read_csv(io.StringIO(csv_data.decode('utf-8')))
-            
-            # Convert CSV to nested structure for compatibility
+
             holdings = {"accounts": {}}
-            
+
             for _, row in df.iterrows():
-                account_name = row['account_name']
-                account_type = row['account_type']
-                symbol = row['symbol']
-                shares = row['shares']
-                purchase_price = row['purchase_price']
+                account_name  = row['account_name']
+                account_type  = row['account_type']
+                symbol        = row['symbol']
+                shares        = float(row['shares'])
+                purchase_price = float(row['purchase_price'])
                 purchase_date = row.get('purchase_date', '')
-                
+
                 if account_name not in holdings["accounts"]:
                     holdings["accounts"][account_name] = {
                         "account_type": account_type,
                         "holdings": {}
                     }
-                
-                holdings["accounts"][account_name]["holdings"][symbol] = {
-                    "shares": shares,
-                    "purchase_price": purchase_price,
-                    "purchase_date": purchase_date
-                }
-            
+
+                acct_holdings = holdings["accounts"][account_name]["holdings"]
+
+                if symbol not in acct_holdings:
+                    acct_holdings[symbol] = {
+                        "shares": shares,
+                        "purchase_price": purchase_price,
+                        "purchase_date": purchase_date
+                    }
+                else:
+                    # Merge lot: accumulate shares, recalculate weighted avg cost
+                    existing = acct_holdings[symbol]
+                    total_shares = existing["shares"] + shares
+                    weighted_avg_price = (
+                        (existing["shares"] * existing["purchase_price"]) +
+                        (shares * purchase_price)
+                    ) / total_shares
+                    existing["shares"] = total_shares
+                    existing["purchase_price"] = round(weighted_avg_price, 4)
+                    logger.info(
+                        f"Merged lot for {symbol} in {account_name}: "
+                        f"{total_shares} total shares @ ${weighted_avg_price:.4f} avg cost"
+                    )
+
             logger.info(f"Successfully loaded holdings for {len(holdings['accounts'])} accounts")
             return holdings
-            
+
         except Exception as e:
             logger.error(f"Failed to load holdings: {e}")
             raise
@@ -233,15 +267,40 @@ class LambdaPortfolioAnalyzer:
         """Generate an HTML version of the portfolio summary for email"""
         if not portfolio_data:
             return "<html><body><h2>No portfolio data available.</h2></body></html>"
-        
-        # Calculate metrics
-        total_purchase_value = sum([data['purchase_price'] * data['shares'] for data in portfolio_data])
-        total_gain_loss_percent = (total_unrealized_gains / total_purchase_value) * 100 if total_purchase_value else 0
-        diversity_score = self.calculate_diversity_score(sector_allocation, total_value)
-        
-        # Color coding for gains/losses
-        portfolio_color = "#28a745" if total_unrealized_gains >= 0 else "#dc3545"
-        
+
+        # ── Pre-compute metrics ──────────────────────────────────────────────
+        total_purchase_value  = sum(d['purchase_price'] * d['shares'] for d in portfolio_data)
+        total_gain_loss_pct   = (total_unrealized_gains / total_purchase_value * 100) if total_purchase_value else 0
+        diversity_score       = self.calculate_diversity_score(sector_allocation, total_value)
+        portfolio_color       = "#28a745" if total_unrealized_gains >= 0 else "#dc3545"
+
+        # Group by account
+        accounts = {}
+        for d in portfolio_data:
+            accounts.setdefault(d['account'], []).append(d)
+
+        # Per-account aggregates
+        account_stats = {}
+        for acct_name, holdings in accounts.items():
+            acct_value        = sum(h['current_value']       for h in holdings)
+            acct_unrealized   = sum(h['unrealized_gain_loss'] for h in holdings)
+            acct_daily_change = sum(h['daily_change']         for h in holdings)
+            prev_value        = acct_value - acct_daily_change
+            acct_daily_pct    = (acct_daily_change / prev_value * 100) if prev_value else 0
+            account_stats[acct_name] = {
+                'type':         holdings[0]['account_type'].title(),
+                'value':        acct_value,
+                'unrealized':   acct_unrealized,
+                'daily_change': acct_daily_change,
+                'daily_pct':    acct_daily_pct,
+            }
+
+        # Top 5 gainers / losers (by daily %)
+        sorted_by_day = sorted(portfolio_data, key=lambda d: d['daily_change_percent'], reverse=True)
+        top_gainers   = sorted_by_day[:5]
+        top_losers    = sorted_by_day[-5:][::-1]   # worst first
+
+        # ── HTML ─────────────────────────────────────────────────────────────
         html = f"""
 <!DOCTYPE html>
 <html>
@@ -249,132 +308,228 @@ class LambdaPortfolioAnalyzer:
     <meta charset="UTF-8">
     <style>
         body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f8f9fa; }}
-        .container {{ max-width: 1200px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        .container {{ max-width: 1300px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
         .header {{ text-align: center; color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; margin-bottom: 20px; }}
-        .overview {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px; }}
+        /* top metric cards */
+        .overview {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px; }}
         .metric-card {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; border-radius: 8px; text-align: center; }}
         .metric-value {{ font-size: 1.5em; font-weight: bold; margin-top: 5px; }}
+        /* account summary box */
+        .account-summary-box {{ border: 1px solid #dee2e6; border-radius: 8px; margin-bottom: 24px; overflow: hidden; }}
+        .account-summary-box h3 {{ margin: 0; padding: 10px 15px; background-color: #343a40; color: white; font-size: 1em; }}
+        .account-summary-table {{ width: 100%; border-collapse: collapse; }}
+        .account-summary-table th {{ background-color: #495057; color: #ccc; padding: 8px 12px; text-align: left; font-size: 0.85em; font-weight: 600; }}
+        .account-summary-table td {{ padding: 9px 12px; border-bottom: 1px solid #f0f0f0; font-size: 0.9em; }}
+        .account-summary-table tr:last-child td {{ border-bottom: none; }}
+        .account-summary-table tr:nth-child(even) td {{ background-color: #f8f9fa; }}
+        /* movers */
+        .movers-section {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }}
+        .movers-box {{ border-radius: 8px; overflow: hidden; border: 1px solid #dee2e6; }}
+        .movers-box h3 {{ margin: 0; padding: 10px 14px; font-size: 0.95em; }}
+        .gainers-title {{ background-color: #d4edda; color: #155724; }}
+        .losers-title  {{ background-color: #f8d7da; color: #721c24; }}
+        .movers-table {{ width: 100%; border-collapse: collapse; }}
+        .movers-table td {{ padding: 7px 12px; border-bottom: 1px solid #f0f0f0; font-size: 0.88em; }}
+        .movers-table tr:last-child td {{ border-bottom: none; }}
+        /* benchmark */
         .benchmark-section {{ background-color: #e9ecef; padding: 15px; border-radius: 8px; margin-bottom: 20px; }}
         .benchmark-item {{ display: inline-block; margin: 5px 15px; padding: 5px 10px; background-color: #6c757d; color: white; border-radius: 5px; }}
+        /* sector */
         .sector-section {{ background-color: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 20px; }}
         .sector-item {{ margin: 5px 0; padding: 5px; background-color: #e9ecef; border-radius: 5px; }}
+        /* account detail tables */
         .account-section {{ margin-bottom: 30px; }}
-        .account-header {{ background-color: #007bff; color: white; padding: 10px; border-radius: 8px; margin-bottom: 10px; }}
-        .holdings-table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
+        .account-header {{ background-color: #007bff; color: white; padding: 10px; border-radius: 8px 8px 0 0; margin-bottom: 0; }}
+        .holdings-table {{ width: 100%; border-collapse: collapse; margin-bottom: 0; }}
         .holdings-table th {{ background-color: #343a40; color: white; padding: 10px; text-align: left; }}
         .holdings-table td {{ padding: 8px; border-bottom: 1px solid #dee2e6; }}
         .holdings-table tr:nth-child(even) {{ background-color: #f8f9fa; }}
+        .account-footer {{ background-color: #e9ecef; padding: 8px 12px; border-top: 2px solid #dee2e6; border-radius: 0 0 8px 8px; font-size: 0.9em; margin-bottom: 20px; }}
         .positive {{ color: #28a745; font-weight: bold; }}
         .negative {{ color: #dc3545; font-weight: bold; }}
-        .neutral {{ color: #6c757d; }}
+        .neutral  {{ color: #6c757d; }}
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>📊 Daily Portfolio Summary</h1>
-            <p>{datetime.now().strftime('%B %d, %Y')}</p>
+<div class="container">
+
+    <div class="header">
+        <h1>📊 Daily Portfolio Summary</h1>
+        <p>{datetime.now().strftime('%B %d, %Y')}</p>
+    </div>
+
+    <!-- ① Top-level metrics -->
+    <div class="overview">
+        <div class="metric-card">
+            <div>Total Portfolio Value</div>
+            <div class="metric-value">${total_value:,.2f}</div>
         </div>
-        
-        <div class="overview">
-            <div class="metric-card">
-                <div>Total Portfolio Value</div>
-                <div class="metric-value">${total_value:,.2f}</div>
-            </div>
-            <div class="metric-card">
-                <div>Unrealized Gains/Loss</div>
-                <div class="metric-value" style="color: {portfolio_color};">${total_unrealized_gains:,.2f} ({total_gain_loss_percent:+.2f}%)</div>
-            </div>
-            <div class="metric-card">
-                <div>Diversity Score</div>
-                <div class="metric-value">{diversity_score}/100</div>
-            </div>
+        <div class="metric-card">
+            <div>Unrealized Gains/Loss</div>
+            <div class="metric-value" style="color:{portfolio_color};">${total_unrealized_gains:,.2f} ({total_gain_loss_pct:+.2f}%)</div>
         </div>
-        
-        <div class="benchmark-section">
-            <h3>🎯 Benchmark Comparison</h3>"""
-        
+        <div class="metric-card">
+            <div>Diversity Score</div>
+            <div class="metric-value">{diversity_score}/100</div>
+        </div>
+    </div>
+
+    <!-- ① Account summary box -->
+    <div class="account-summary-box">
+        <h3>🏦 Account Totals</h3>
+        <table class="account-summary-table">
+            <thead>
+                <tr>
+                    <th>Account</th>
+                    <th>Type</th>
+                    <th>Value</th>
+                    <th>Unrealized P&L</th>
+                    <th>Today's Change $</th>
+                    <th>Today's Change %</th>
+                </tr>
+            </thead>
+            <tbody>"""
+
+        for acct_name, s in account_stats.items():
+            unr_color   = "#28a745" if s['unrealized']   >= 0 else "#dc3545"
+            daily_color = "#28a745" if s['daily_change'] >= 0 else "#dc3545"
+            html += f"""
+                <tr>
+                    <td><strong>{acct_name}</strong></td>
+                    <td>{s['type']}</td>
+                    <td>${s['value']:,.2f}</td>
+                    <td style="color:{unr_color};font-weight:bold;">${s['unrealized']:+,.2f}</td>
+                    <td style="color:{daily_color};font-weight:bold;">${s['daily_change']:+,.2f}</td>
+                    <td style="color:{daily_color};font-weight:bold;">{s['daily_pct']:+.2f}%</td>
+                </tr>"""
+
+        html += """
+            </tbody>
+        </table>
+    </div>
+
+    <!-- ② Top 5 Gainers / Losers -->
+    <div class="movers-section">
+        <div class="movers-box">
+            <h3 class="gainers-title">🚀 Top 5 Gainers Today</h3>
+            <table class="movers-table">"""
+
+        for d in top_gainers:
+            html += f"""
+                <tr>
+                    <td><strong>{d['symbol']}</strong></td>
+                    <td>{d['company_name']}</td>
+                    <td class="positive">{d['daily_change_percent']:+.2f}%</td>
+                    <td class="positive">${d['daily_change']:+,.0f}</td>
+                </tr>"""
+
+        html += """
+            </table>
+        </div>
+        <div class="movers-box">
+            <h3 class="losers-title">📉 Top 5 Losers Today</h3>
+            <table class="movers-table">"""
+
+        for d in top_losers:
+            html += f"""
+                <tr>
+                    <td><strong>{d['symbol']}</strong></td>
+                    <td>{d['company_name']}</td>
+                    <td class="negative">{d['daily_change_percent']:+.2f}%</td>
+                    <td class="negative">${d['daily_change']:+,.0f}</td>
+                </tr>"""
+
+        html += """
+            </table>
+        </div>
+    </div>
+
+    <!-- Benchmark -->
+    <div class="benchmark-section">
+        <h3>🎯 Benchmark Comparison</h3>"""
+
         for benchmark_name, data in benchmark_data.items():
             color = "#28a745" if data['daily_change_percent'] >= 0 else "#dc3545"
-            html += f'<span class="benchmark-item" style="background-color: {color};">{benchmark_name}: {data["daily_change_percent"]:+.2f}%</span>'
-        
+            html += f'<span class="benchmark-item" style="background-color:{color};">{benchmark_name}: {data["daily_change_percent"]:+.2f}%</span>'
+
         html += f"""
-        </div>
-        
-        <div class="sector-section">
-            <h3>📊 Sector Allocation</h3>"""
-        
+    </div>
+
+    <!-- Sector allocation -->
+    <div class="sector-section">
+        <h3>📊 Sector Allocation</h3>"""
+
         for sector, value in sorted(sector_allocation.items(), key=lambda x: x[1], reverse=True):
-            percentage = (value / total_value) * 100
-            html += f'<div class="sector-item"><strong>{sector}:</strong> ${value:,.0f} ({percentage:.1f}%)</div>'
-        
-        html += """
-        </div>
-        
-        <h3>🏦 Holdings by Account</h3>"""
-        
-        # Group by account
-        accounts = {}
-        for data in portfolio_data:
-            account = data['account']
-            if account not in accounts:
-                accounts[account] = []
-            accounts[account].append(data)
-        
-        for account_name, holdings_list in accounts.items():
-            account_value = sum([h['current_value'] for h in holdings_list])
-            account_gain_loss = sum([h['unrealized_gain_loss'] for h in holdings_list])
-            account_type = holdings_list[0]['account_type'].title()
-            
-            html += f"""
-        <div class="account-section">
-            <div class="account-header">
-                <strong>{account_name} ({account_type})</strong> - 
-                Value: ${account_value:,.2f} | 
-                Unrealized: <span style="color: {'#90EE90' if account_gain_loss >= 0 else '#FFB6C1'};">${account_gain_loss:,.2f}</span>
-            </div>
-            <table class="holdings-table">
-                <thead>
-                    <tr>
-                        <th>Ticker</th>
-                        <th>Company</th>
-                        <th>Sector</th>
-                        <th>Price</th>
-                        <th>Holdings</th>
-                        <th>Daily Change %</th>
-                        <th>Daily Change $</th>
-                    </tr>
-                </thead>
-                <tbody>"""
-            
-            # Sort holdings by daily change percentage
-            sorted_holdings = sorted(holdings_list, key=lambda x: x['daily_change_percent'], reverse=True)
-            
-            for data in sorted_holdings:
-                change_class = "positive" if data['daily_change_percent'] >= 0 else "negative"
-                holdings_text = f"{data['shares']} shares (${data['current_value']:,.0f})"
-                
-                html += f"""
-                    <tr>
-                        <td><strong>{data['symbol']}</strong></td>
-                        <td>{data['company_name']}</td>
-                        <td>{data['sector']}</td>
-                        <td>${data['current_price']:.2f}</td>
-                        <td>{holdings_text}</td>
-                        <td class="{change_class}">{data['daily_change_percent']:+.2f}%</td>
-                        <td class="{change_class}">${data['daily_change']:+,.0f}</td>
-                    </tr>"""
-            
-            html += """
-                </tbody>
-            </table>
-        </div>"""
-        
+            pct = (value / total_value) * 100
+            html += f'<div class="sector-item"><strong>{sector}:</strong> ${value:,.0f} ({pct:.1f}%)</div>'
+
         html += """
     </div>
+
+    <h3>🏦 Holdings by Account</h3>"""
+
+        # ④ Per-account detail tables
+        for account_name, holdings_list in accounts.items():
+            s             = account_stats[account_name]
+            unr_color     = "#90EE90" if s['unrealized']   >= 0 else "#FFB6C1"
+            daily_color   = "#90EE90" if s['daily_change'] >= 0 else "#FFB6C1"
+            sorted_hold   = sorted(holdings_list, key=lambda x: x['daily_change_percent'], reverse=True)
+
+            html += f"""
+    <div class="account-section">
+        <div class="account-header">
+            <strong>{account_name} ({s['type']})</strong> &nbsp;|&nbsp;
+            Value: ${s['value']:,.2f} &nbsp;|&nbsp;
+            Unrealized: <span style="color:{unr_color};">${s['unrealized']:+,.2f}</span>
+        </div>
+        <table class="holdings-table">
+            <thead>
+                <tr>
+                    <th>Ticker</th>
+                    <th>Company</th>
+                    <th>Sector</th>
+                    <th>Price</th>
+                    <th>Shares</th>
+                    <th>Value</th>
+                    <th>Daily Change %</th>
+                    <th>Daily Change $</th>
+                </tr>
+            </thead>
+            <tbody>"""
+
+            for d in sorted_hold:
+                cc = "positive" if d['daily_change_percent'] >= 0 else "negative"
+                html += f"""
+                <tr>
+                    <td><strong>{d['symbol']}</strong></td>
+                    <td>{d['company_name']}</td>
+                    <td>{d['sector']}</td>
+                    <td>${d['current_price']:.2f}</td>
+                    <td>{d['shares']:,.4g}</td>
+                    <td>${d['current_value']:,.0f}</td>
+                    <td class="{cc}">{d['daily_change_percent']:+.2f}%</td>
+                    <td class="{cc}">${d['daily_change']:+,.0f}</td>
+                </tr>"""
+
+            # ③ Account daily aggregate footer
+            footer_daily_color = "#28a745" if s['daily_change'] >= 0 else "#dc3545"
+            html += f"""
+            </tbody>
+        </table>
+        <div class="account-footer">
+            <strong>Today's account total:</strong>
+            <span style="color:{footer_daily_color};font-weight:bold;">
+                ${s['daily_change']:+,.2f} ({s['daily_pct']:+.2f}%)
+            </span>
+            &nbsp;—&nbsp; {len(holdings_list)} position{'s' if len(holdings_list) != 1 else ''}
+        </div>
+    </div>"""
+
+        html += """
+</div>
 </body>
 </html>"""
-        
+
         return html
     
     def send_email_summary(self, html_summary):

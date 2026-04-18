@@ -3,8 +3,9 @@
 Stock data provider abstraction layer.
 
 To switch providers, set the DATA_PROVIDER environment variable:
-  - "yfinance"       : Yahoo Finance (default, free, no API key required)
-  - "alpha_vantage"  : Alpha Vantage (requires ALPHA_VANTAGE_API_KEY, better for production)
+  - "finnhub"        : Finnhub (default, free tier: 60 req/min, requires API key)
+  - "yfinance"       : Yahoo Finance (free, no API key, but prone to rate limiting)
+  - "alpha_vantage"  : Alpha Vantage (requires API key, better for production)
 
 All providers return the same dict shape from get_stock_data():
 {
@@ -181,22 +182,107 @@ class AlphaVantageProvider(StockDataProvider):
 
 
 # ---------------------------------------------------------------------------
+# Finnhub provider — free tier: 60 req/min, reliable, requires API key
+# ---------------------------------------------------------------------------
+
+class FinnhubProvider(StockDataProvider):
+    """
+    Uses the Finnhub REST API.
+    Free tier: 60 API calls/minute — comfortably handles large portfolios.
+    Requires a free API key from https://finnhub.io
+
+    Two calls per symbol:
+      - /quote        → price, prev close, change, volume
+      - /stock/profile2 → company name, sector
+    """
+
+    BASE_URL = "https://finnhub.io/api/v1"
+
+    def __init__(self, api_key: str):
+        if not api_key:
+            raise ValueError("FinnhubProvider requires a non-empty api_key")
+        self.api_key = api_key
+
+    def _get(self, endpoint: str, params: dict) -> dict:
+        import requests as _requests
+        resp = _requests.get(
+            f"{self.BASE_URL}/{endpoint}",
+            params={**params, 'token': self.api_key},
+            timeout=10
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_stock_data(self, symbol: str) -> dict | None:
+        try:
+            # --- quote ---
+            quote = self._get('quote', {'symbol': symbol})
+
+            current_price = float(quote.get('c') or 0)
+            prev_close    = float(quote.get('pc') or 0)
+
+            if not current_price:
+                logger.warning(f"[finnhub] No price data for {symbol}")
+                return None
+
+            prev_close  = prev_close or current_price
+            change      = current_price - prev_close
+            change_pct  = (change / prev_close * 100) if prev_close else 0
+            volume      = int(quote.get('v') or 0)
+
+            # --- company profile ---
+            company_name = symbol
+            sector       = 'Unknown'
+            try:
+                profile = self._get('stock/profile2', {'symbol': symbol})
+                company_name = profile.get('name') or symbol
+                sector       = profile.get('finnhubIndustry') or 'Unknown'
+            except Exception as e:
+                logger.warning(f"[finnhub] Could not fetch profile for {symbol}: {e}")
+
+            logger.info(f"[finnhub] {symbol}: ${current_price:.2f} ({change_pct:+.2f}%)")
+            return {
+                'symbol':         symbol,
+                'current_price':  current_price,
+                'previous_close': prev_close,
+                'change':         change,
+                'change_percent': change_pct,
+                'volume':         volume,
+                'company_name':   company_name,
+                'sector':         sector,
+            }
+
+        except Exception as e:
+            logger.error(f"[finnhub] Error fetching {symbol}: {e}")
+            return None
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-def get_provider(provider_name: str = 'yfinance', alpha_vantage_key: str = None) -> StockDataProvider:
+def get_provider(
+    provider_name: str = 'finnhub',
+    alpha_vantage_key: str = None,
+    finnhub_key: str = None,
+) -> StockDataProvider:
     """
     Return the correct provider instance.
 
     Usage:
-        provider = get_provider(os.getenv('DATA_PROVIDER', 'yfinance'), api_key)
+        provider = get_provider(os.getenv('DATA_PROVIDER', 'finnhub'), finnhub_key=key)
         data = provider.get_stock_data('AAPL')
 
     Args:
-        provider_name:      'yfinance' or 'alpha_vantage'
-        alpha_vantage_key:  Required when provider_name == 'alpha_vantage'
+        provider_name:     'finnhub' (default), 'yfinance', or 'alpha_vantage'
+        finnhub_key:       Required when provider_name == 'finnhub'
+        alpha_vantage_key: Required when provider_name == 'alpha_vantage'
     """
-    name = (provider_name or 'yfinance').lower().strip()
+    name = (provider_name or 'finnhub').lower().strip()
+
+    if name == 'finnhub':
+        logger.info("Using Finnhub data provider")
+        return FinnhubProvider(api_key=finnhub_key)
 
     if name == 'yfinance':
         logger.info("Using YFinance data provider")
@@ -208,5 +294,5 @@ def get_provider(provider_name: str = 'yfinance', alpha_vantage_key: str = None)
 
     raise ValueError(
         f"Unknown DATA_PROVIDER '{provider_name}'. "
-        "Valid options: 'yfinance', 'alpha_vantage'"
+        "Valid options: 'finnhub', 'yfinance', 'alpha_vantage'"
     )
