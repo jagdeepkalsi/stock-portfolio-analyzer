@@ -7,3 +7,5 @@ holdings.csv
 portfolio.json
 .env
 lambda-deployment.zip
+out/
+
