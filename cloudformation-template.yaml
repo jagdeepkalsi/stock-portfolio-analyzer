@@ -220,6 +220,53 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt NewsAlertScheduleRule.Arn
 
+  # Market Pulse digest Lambda (trends + congressional trades) — same zip, separate handler + schedule
+  MarketDigestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: portfolio-market-digest
+      Runtime: python3.11
+      Handler: lambda_function.market_digest_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3Key
+      Timeout: 300   # 5 minutes — yfinance bar fetches + two JSON feeds
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref PortfolioBucket
+          DATA_PROVIDER: yfinance
+      Description: 'Daily Market Pulse digest (market trends + congressional trades)'
+
+  # CloudWatch Log Group for Market Pulse
+  MarketDigestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${MarketDigestFunction}"
+      RetentionInDays: 30
+
+  # EventBridge rule: daily at 6:00 PM ET (23:00 UTC when ET is EST, 22:00 UTC when EDT)
+  # Using 23:00 UTC year-round; during DST the digest will arrive at 7 PM ET instead.
+  MarketDigestScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger Market Pulse digest daily at 6 PM ET"
+      ScheduleExpression: "cron(0 23 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt MarketDigestFunction.Arn
+          Id: "MarketDigestTarget"
+
+  # Permission for EventBridge to invoke Market Pulse Lambda
+  MarketDigestInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MarketDigestFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MarketDigestScheduleRule.Arn
+
 Outputs:
   LambdaFunctionArn:
     Description: "Portfolio Analyzer Lambda Function ARN"
@@ -260,3 +307,15 @@ Outputs:
     Value: !GetAtt NewsAlertScheduleRule.Arn
     Export:
       Name: !Sub "${AWS::StackName}-schedule-rule"
+
+  MarketDigestFunctionArn:
+    Description: "Market Pulse Lambda Function ARN"
+    Value: !GetAtt MarketDigestFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-market-digest-lambda-arn"
+
+  MarketDigestScheduleRuleArn:
+    Description: "Market Pulse schedule rule ARN"
+    Value: !GetAtt MarketDigestScheduleRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-market-digest-schedule-rule"

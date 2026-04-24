@@ -810,3 +810,129 @@ def news_alert_handler(event, context):
                 'timestamp': start_time.isoformat(),
             })
         }
+
+
+# ---------------------------------------------------------------------------
+# Market Pulse digest (market trends + congressional trades)
+# ---------------------------------------------------------------------------
+
+class LambdaMarketDigestGenerator:
+    """
+    Lambda wrapper around market_digest.build_digest + render_email_html.
+    Reuses LambdaPortfolioAnalyzer for credentials, config, and SMTP.
+    """
+
+    def __init__(self):
+        self._analyzer = LambdaPortfolioAnalyzer()
+        self.digest_cfg = None
+
+    def initialize(self):
+        # Populates self._analyzer.portfolio_config, smtp_user, smtp_password
+        self._analyzer.initialize_credentials()
+        self._analyzer.load_portfolio_config()
+
+        from market_digest import load_digest_config
+        self.digest_cfg = load_digest_config(self._analyzer.portfolio_config)
+
+    def run(self) -> dict:
+        from market_digest import build_digest, render_email_html
+
+        digest = build_digest(self._analyzer.portfolio_config, self.digest_cfg)
+        html   = render_email_html(digest)
+
+        if self.digest_cfg.get('send_email', True):
+            self._send_email(html, digest.get('generated_at_display', ''))
+
+        counts = digest.get('congress', {}).get('counts', {})
+        return {
+            'generated_at':     digest.get('generated_at'),
+            'congress_counts':  counts,
+            'highlights':       digest.get('trends', {}).get('highlights', []),
+        }
+
+    def _send_email(self, html: str, generated_at: str):
+        try:
+            email_settings = self._analyzer.portfolio_config.get('settings', {}).get('email_settings', {})
+            recipient      = email_settings.get('recipient')
+
+            if not recipient or recipient == 'your-email@example.com':
+                logger.warning("Email recipient not configured — skipping Market Pulse email")
+                return
+
+            subject_date = generated_at.split(' · ')[0] if generated_at else datetime.now().strftime('%B %d, %Y')
+
+            msg = MIMEMultipart('alternative')
+            msg['From']    = self._analyzer.smtp_user
+            msg['To']      = recipient
+            msg['Subject'] = f"[Market Pulse] {subject_date}"
+
+            msg.attach(MIMEText("Market Pulse — view in an HTML-capable email client.", 'plain'))
+            msg.attach(MIMEText(html, 'html'))
+
+            server = smtplib.SMTP(
+                email_settings.get('smtp_server', 'smtp.gmail.com'),
+                email_settings.get('smtp_port', 587),
+            )
+            server.starttls()
+            server.login(self._analyzer.smtp_user, self._analyzer.smtp_password)
+            server.send_message(msg)
+            server.quit()
+            logger.info(f"Market Pulse email sent to {recipient}")
+
+        except Exception as e:
+            logger.error(f"Failed to send Market Pulse email: {e}")
+            raise
+
+
+def market_digest_handler(event, context):
+    """
+    AWS Lambda handler for the daily Market Pulse digest.
+
+    Triggered by EventBridge on its own schedule (default: daily 6 PM ET,
+    cron(0 23 * * ? *) UTC). Config lives in portfolio.json under
+    settings.market_digest.
+    """
+    start_time = datetime.now()
+    logger.info(f"Market digest handler started at {start_time.isoformat()}")
+
+    try:
+        generator = LambdaMarketDigestGenerator()
+        generator.initialize()
+
+        if not generator.digest_cfg.get('enabled', True):
+            logger.info("Market digest disabled in portfolio.json — exiting")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'message':   'Market digest disabled in portfolio config',
+                    'timestamp': start_time.isoformat(),
+                })
+            }
+
+        result = generator.run()
+
+        end_time       = datetime.now()
+        execution_time = (end_time - start_time).total_seconds()
+        logger.info(f"Market digest completed in {execution_time:.2f}s — {result.get('congress_counts')}")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message':                'Market digest completed successfully',
+                'timestamp':              start_time.isoformat(),
+                'execution_time_seconds': execution_time,
+                'congress_counts':        result.get('congress_counts', {}),
+                'highlights':             result.get('highlights', []),
+            })
+        }
+
+    except Exception as e:
+        logger.error(f"Market digest failed: {str(e)}", exc_info=True)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error':     'Market digest failed',
+                'message':   str(e),
+                'timestamp': start_time.isoformat(),
+            })
+        }

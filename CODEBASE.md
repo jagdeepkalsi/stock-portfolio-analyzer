@@ -311,6 +311,17 @@ class LambdaNewsAlertGenerator:
 
 def news_alert_handler(event, context)   # news digest — triggered 7:30 AM ET weekdays
     # EventBridge: cron(30 12 ? * MON-FRI *)
+
+class LambdaMarketDigestGenerator:
+    # Reuses LambdaPortfolioAnalyzer for credential/S3/SMTP.
+    # Delegates data + rendering to market_digest.py → market_trends.py + congress_providers.py.
+    def initialize()    # loads credentials + portfolio_config + market_digest cfg
+    def run() -> dict
+    def _send_email(html, generated_at)
+
+def market_digest_handler(event, context)   # Market Pulse — triggered daily 6 PM ET
+    # EventBridge: cron(0 23 * * ? *)
+    # Lambda: portfolio-market-digest, 512 MB, 300s timeout, DATA_PROVIDER=yfinance
 ```
 
 **AWS Secrets Manager paths:**
@@ -457,6 +468,25 @@ aws lambda invoke --function-name portfolio-news-alert --region us-west-2 respon
 
 # Watch logs
 aws logs tail /aws/lambda/portfolio-news-alert --follow --region us-west-2
+
+# Invoke Market Pulse Lambda on demand
+aws lambda invoke --function-name portfolio-market-digest --region us-west-2 market-response.json && cat market-response.json
+
+# Watch Market Pulse logs
+aws logs tail /aws/lambda/portfolio-market-digest --follow --region us-west-2
+```
+
+**Market Pulse config (portfolio.json → settings.market_digest):**
+
+```json
+{
+  "enabled":                true,
+  "send_email":             true,
+  "congress_lookback_days": 7,
+  "congress_basis":         "disclosure",
+  "max_priority_trades":    25,
+  "max_other_trades":       50
+}
 ```
 
 ---
