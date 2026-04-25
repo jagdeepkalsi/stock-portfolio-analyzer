@@ -7,12 +7,13 @@
 
 ## What This Project Does
 
-Two independent daily emails sent to **jagdeep.kalsi@gmail.com**:
+Three independent emails sent to **jagdeep.kalsi@gmail.com**:
 
 | Email | Script | Schedule | Purpose |
 |-------|--------|----------|---------|
 | Portfolio Summary | `portfolio_analyzer.py` | 2:00 PM ET (weekdays) | Total value, unrealized gains, sector allocation, benchmark vs S&P/NASDAQ |
 | Pre-Market News Digest | `news_alert.py` | 7:30 AM ET (weekdays) | 3-section news digest: market news, portfolio impact stories, per-holding news |
+| Market Pulse | `market_digest.py` | daily | Market trend snapshot (daily+weekly) + Congressional trades (Pelosi priority) |
 
 Both run locally via cron **or** on AWS Lambda + EventBridge (same code, different entry points).
 
@@ -27,6 +28,9 @@ data_providers.py         Stock price provider abstraction (Finnhub / yfinance /
 news_providers.py         News provider abstraction (Finnhub / Alpha Vantage / MarketWatch RSS)
 news_scorer.py            Article scoring, impact tagging, deduplication
 news_alert.py             News alert orchestrator + HTML email renderer
+market_trends.py          Index/sector/macro performance via yfinance (1D/1W/1M)
+congress_providers.py     House + Senate Stock Watcher feed adapters
+market_digest.py          Market Pulse orchestrator + HTML email renderer
 holdings.csv              Portfolio holdings (gitignored — real data)
 portfolio.json            Runtime config (gitignored — real data)
 .env                      API keys + SMTP credentials (gitignored)
@@ -307,6 +311,17 @@ class LambdaNewsAlertGenerator:
 
 def news_alert_handler(event, context)   # news digest — triggered 7:30 AM ET weekdays
     # EventBridge: cron(30 12 ? * MON-FRI *)
+
+class LambdaMarketDigestGenerator:
+    # Reuses LambdaPortfolioAnalyzer for credential/S3/SMTP.
+    # Delegates data + rendering to market_digest.py → market_trends.py + congress_providers.py.
+    def initialize()    # loads credentials + portfolio_config + market_digest cfg
+    def run() -> dict
+    def _send_email(html, generated_at)
+
+def market_digest_handler(event, context)   # Market Pulse — triggered daily 6 PM ET
+    # EventBridge: cron(0 23 * * ? *)
+    # Lambda: portfolio-market-digest, 512 MB, 300s timeout, DATA_PROVIDER=yfinance
 ```
 
 **AWS Secrets Manager paths:**
@@ -316,6 +331,97 @@ def news_alert_handler(event, context)   # news digest — triggered 7:30 AM ET 
 **S3 Bucket:** `{stack-name}-portfolio-data`
 - `portfolio.json`
 - `holdings.csv`
+
+---
+
+## Module: `market_trends.py`
+
+Free market-wide snapshot via yfinance. Pulls ~2 months of daily bars per symbol
+and computes 1D / 5-session (1W) / 21-session (1M) % changes from the same
+close series so periods are consistent.
+
+```python
+INDEXES  = [SPY, QQQ, IWM, DIA]
+SECTORS  = [XLK, XLF, XLV, XLY, XLP, XLE, XLI, XLB, XLRE, XLU, XLC]  # SPDRs
+MACRO    = [^VIX, ^TNX, DX-Y.NYB, CL=F, GC=F, BTC-USD]
+
+def fetch_market_trends() -> dict
+    # {
+    #   'generated_at': ISO, 'generated_at_display': str,
+    #   'indexes' | 'sectors' | 'macro': [{symbol, label, price, change_1d/_1w/_1m}, ...],
+    #   'sector_movers': {'winners': [...3], 'losers': [...3]},  # by 1W
+    #   'highlights': ['bullet', ...],  # deterministic, max 6
+    # }
+```
+
+Highlight rules (plain English bullets): S&P direction, SPY-vs-IWM spread,
+QQQ-vs-SPY spread, top/bottom sector, VIX >=10% move, 10Y yield >=3% move,
+BTC >=5% move, oil >=4% move. Graceful per-symbol failure — other rows still
+render. Pure yfinance (no key).
+
+---
+
+## Module: `congress_providers.py`
+
+Normalized adapter for the free House + Senate Stock Watcher S3 JSON feeds.
+
+```python
+HOUSE_FEED_URL  = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
+SENATE_FEED_URL = "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json"
+PRIORITY_MEMBERS = {"pelosi"}  # lowercased substring match
+
+def fetch_recent_trades(lookback_days=7, basis="disclosure") -> dict
+    # basis='disclosure' → filter by when the PTR became public (default)
+    # basis='transaction' → filter by actual trade date
+    # Returns:
+    # {
+    #   lookback_days, basis, cutoff_date,
+    #   counts: {house, senate, priority, total},
+    #   priority_trades: [...newest first],       # Pelosi etc
+    #   all_trades:      [...sorted by amount desc],
+    # }
+```
+
+Normalized trade shape: `{chamber, member, party, state, district, ticker,
+asset, transaction (purchase|sale|exchange|other), raw_type, amount_range,
+amount_min, amount_max, transaction_date, disclosure_date, days_to_disclose,
+ptr_url, is_priority}`.
+
+Caveats: feeds lag actual disclosures by 24-48h; members' party affiliations
+are not in the source — `party` is always None in v1; amount is a range
+(STOCK Act discloses bands, not exact dollars).
+
+---
+
+## Module: `market_digest.py`
+
+Main orchestrator for the Market Pulse email. Entry point: `python market_digest.py`.
+
+```python
+def load_digest_config(portfolio) -> dict
+    # settings.market_digest keys (all optional):
+    #   enabled, send_email, congress_lookback_days, congress_basis,
+    #   max_priority_trades, max_other_trades
+
+def build_digest(portfolio, cfg) -> dict
+    # { generated_at, generated_at_display,
+    #   trends:   <fetch_market_trends output>,
+    #   congress: <fetch_recent_trades output + 'other_trades' = all minus priority> }
+
+def render_email_html(digest) -> str
+def send_email(html, portfolio, subject_date) -> bool
+```
+
+CLI:
+- `python market_digest.py`        — build + send (reads `portfolio.json`)
+- `python market_digest.py --dry`  — build + write `out/market_pulse_YYYYMMDD.{html,json}`, skip email
+- `python market_digest.py --config path.json`
+
+Email layout:
+- Header banner (black) with generated timestamp
+- Section 1: bullet highlights + Major indexes / Sector rotation / Macro tape tables
+- Section 2: congressional trade counts summary + Priority table (yellow bg) + All others (by size)
+- 1D / 1W / 1M columns with green (+) / red (-) coloring; tabular-nums for numeric alignment
 
 ---
 
@@ -329,6 +435,10 @@ python news_alert.py
 
 # Portfolio summary
 python portfolio_analyzer.py
+
+# Market Pulse (trends + congress)
+python market_digest.py          # send email
+python market_digest.py --dry    # write to ./out/ instead
 
 # Cron schedule (add to crontab -e)
 30 7 * * 1-5  cd /path/to/app && python news_alert.py >> logs/news_alert.log 2>&1
@@ -358,6 +468,25 @@ aws lambda invoke --function-name portfolio-news-alert --region us-west-2 respon
 
 # Watch logs
 aws logs tail /aws/lambda/portfolio-news-alert --follow --region us-west-2
+
+# Invoke Market Pulse Lambda on demand
+aws lambda invoke --function-name portfolio-market-digest --region us-west-2 market-response.json && cat market-response.json
+
+# Watch Market Pulse logs
+aws logs tail /aws/lambda/portfolio-market-digest --follow --region us-west-2
+```
+
+**Market Pulse config (portfolio.json → settings.market_digest):**
+
+```json
+{
+  "enabled":                true,
+  "send_email":             true,
+  "congress_lookback_days": 7,
+  "congress_basis":         "disclosure",
+  "max_priority_trades":    25,
+  "max_other_trades":       50
+}
 ```
 
 ---

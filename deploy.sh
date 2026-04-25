@@ -3,6 +3,10 @@
 # AWS Lambda Deployment Script for Portfolio Analyzer
 set -e
 
+# Disable AWS CLI v2's interactive pager so the script never gets stuck on
+# `(END)` waiting for keypresses while displaying JSON output.
+export AWS_PAGER=""
+
 echo "🚀 Starting deployment of Portfolio Analyzer to AWS Lambda..."
 
 # Configuration
@@ -22,10 +26,21 @@ cp data_providers.py build/
 cp news_providers.py build/
 cp news_scorer.py build/
 cp news_alert.py build/
+cp market_trends.py build/
+cp congress_providers.py build/
+cp market_digest.py build/
 
-# Install dependencies
-echo "📚 Installing Python dependencies..."
-pip3 install -r requirements-lambda.txt -t build/
+# Install dependencies — force Linux x86_64 wheels so numpy/pandas binaries
+# match the Lambda runtime (otherwise macOS-built wheels fail to import there).
+echo "📚 Installing Python dependencies (linux x86_64 wheels)..."
+pip3 install \
+    --platform manylinux2014_x86_64 \
+    --target build/ \
+    --implementation cp \
+    --python-version 3.11 \
+    --only-binary=:all: \
+    --upgrade \
+    -r requirements-lambda.txt
 
 # Create deployment zip
 echo "🗜️ Creating deployment zip..."
@@ -64,6 +79,14 @@ aws lambda update-function-code \
     --s3-key lambda-deployment.zip \
     --region $REGION
 
+# Update market digest Lambda function code
+echo "🔄 Updating market digest Lambda function code..."
+aws lambda update-function-code \
+    --function-name portfolio-market-digest \
+    --s3-bucket $S3_BUCKET \
+    --s3-key lambda-deployment.zip \
+    --region $REGION
+
 echo "✅ Deployment completed successfully!"
 echo ""
 echo "📋 Next steps:"
@@ -77,5 +100,7 @@ echo ""
 echo "🔗 Useful commands:"
 echo "aws lambda invoke --function-name $FUNCTION_NAME response.json && cat response.json"
 echo "aws lambda invoke --function-name portfolio-news-alert news-response.json && cat news-response.json"
+echo "aws lambda invoke --function-name portfolio-market-digest market-response.json && cat market-response.json"
 echo "aws logs tail /aws/lambda/$FUNCTION_NAME --follow"
 echo "aws logs tail /aws/lambda/portfolio-news-alert --follow"
+echo "aws logs tail /aws/lambda/portfolio-market-digest --follow"
