@@ -3,6 +3,10 @@
 # AWS Lambda Deployment Script for Portfolio Analyzer
 set -e
 
+# Disable AWS CLI v2's interactive pager so the script never gets stuck on
+# `(END)` waiting for keypresses while displaying JSON output.
+export AWS_PAGER=""
+
 echo "🚀 Starting deployment of Portfolio Analyzer to AWS Lambda..."
 
 # Configuration
