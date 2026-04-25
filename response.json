@@ -1,0 +1,1 @@
+{"statusCode": 200, "body": "{\"message\": \"Market digest completed successfully\", \"timestamp\": \"2026-04-25T06:53:05.355757\", \"execution_time_seconds\": 8.266735, \"congress_counts\": {\"house\": 32, \"senate\": 1, \"priority\": 0, \"total\": 33}, \"highlights\": [\"S&P 500 closed higher on the day (+0.77%).\"]}"}

@@ -70,6 +70,9 @@ aws lambda update-function-code \
     --s3-bucket $S3_BUCKET \
     --s3-key lambda-deployment.zip \
     --region $REGION
+aws lambda wait function-updated \
+    --function-name $FUNCTION_NAME \
+    --region $REGION
 
 # Update news alert Lambda function code
 echo "🔄 Updating news alert Lambda function code..."
@@ -78,6 +81,9 @@ aws lambda update-function-code \
     --s3-bucket $S3_BUCKET \
     --s3-key lambda-deployment.zip \
     --region $REGION
+aws lambda wait function-updated \
+    --function-name portfolio-news-alert \
+    --region $REGION
 
 # Update market digest Lambda function code
 echo "🔄 Updating market digest Lambda function code..."
@@ -85,6 +91,9 @@ aws lambda update-function-code \
     --function-name portfolio-market-digest \
     --s3-bucket $S3_BUCKET \
     --s3-key lambda-deployment.zip \
+    --region $REGION
+aws lambda wait function-updated \
+    --function-name portfolio-market-digest \
     --region $REGION
 
 echo "✅ Deployment completed successfully!"

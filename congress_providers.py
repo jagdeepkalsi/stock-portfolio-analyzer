@@ -39,12 +39,14 @@ import logging
 import json
 import re
 from html import unescape
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+UTC = timezone.utc
 
 CAPITOL_TRADES_URL = "https://bff.capitoltrades.com/trades"
 CAPITOL_TRADES_WEB_URL = "https://www.capitoltrades.com/trades"
