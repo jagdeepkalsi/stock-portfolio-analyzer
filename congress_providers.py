@@ -3,9 +3,11 @@
 Congressional trade data provider — CapitolTrades.com.
 
 Fetches disclosed equity trades for U.S. House and Senate members from
-CapitolTrades' public BFF (backend-for-frontend) JSON API:
+CapitolTrades. The provider tries the JSON BFF endpoint first and falls back to
+the server-rendered /trades pages when the BFF is unavailable or blocked:
 
   https://bff.capitoltrades.com/trades
+  https://www.capitoltrades.com/trades?page=...
 
 CapitolTrades aggregates official STOCK Act PTR filings from both chambers.
 Disclosures typically lag actual trades by ~24-48 hours plus any reporting
@@ -34,8 +36,10 @@ Normalized trade dict shape:
 """
 
 import logging
+import json
 import re
-from datetime import datetime, timedelta
+from html import unescape
+from datetime import datetime, timedelta, UTC
 from typing import Optional
 
 import requests
@@ -43,6 +47,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 CAPITOL_TRADES_URL = "https://bff.capitoltrades.com/trades"
+CAPITOL_TRADES_WEB_URL = "https://www.capitoltrades.com/trades"
 
 # CapitolTrades' BFF rejects requests without a browser-ish User-Agent.
 USER_AGENT = (
@@ -199,7 +204,163 @@ def _normalize_trade(row: dict) -> dict:
     }
 
 
-def _fetch_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
+def _ticker_from_capitol_issuer(issuer: dict) -> str:
+    raw = ((issuer or {}).get("issuerTicker") or "").strip().upper()
+    if not raw:
+        return "—"
+    return raw.split(":", 1)[0]
+
+
+def _amount_range_from_value(value) -> str:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    return f"${n:,.0f}"
+
+
+def _normalize_capitol_trade(row: dict) -> dict:
+    politician = row.get("politician") or {}
+    issuer     = row.get("issuer") or {}
+
+    first_name = (politician.get("firstName") or "").strip()
+    last_name  = (politician.get("lastName") or "").strip()
+    full_name  = f"{first_name} {last_name}".strip()
+
+    transaction, raw_type = _normalize_type(row.get("txType") or row.get("txTypeExtended"))
+    tx_date  = _parse_date(row.get("txDate"))
+    dis_date = _parse_date(row.get("pubDate"))
+
+    value = row.get("value")
+    amount_range = _amount_range_from_value(value)
+    lo, hi = _parse_amount(amount_range)
+
+    chamber_raw = (row.get("chamber") or politician.get("chamber") or "").lower()
+    chamber = "Senate" if chamber_raw == "senate" else "House"
+
+    return {
+        "chamber":          chamber,
+        "member":           full_name,
+        "party":            _normalize_party(politician.get("party")),
+        "state":            politician.get("_stateId") or politician.get("stateId") or politician.get("state"),
+        "district":         None,
+        "ticker":           _ticker_from_capitol_issuer(issuer),
+        "asset":            (issuer.get("issuerName") or "").strip(),
+        "transaction":      transaction,
+        "raw_type":         raw_type,
+        "amount_range":     amount_range,
+        "amount_min":       lo,
+        "amount_max":       hi,
+        "transaction_date": tx_date,
+        "disclosure_date":  dis_date,
+        "days_to_disclose": row.get("reportingGap") if row.get("reportingGap") is not None else _days_between(tx_date, dis_date),
+        "ptr_url":          f"https://www.capitoltrades.com/trades/{row.get('_txId')}" if row.get("_txId") else None,
+        "is_priority":      _is_priority(full_name),
+    }
+
+
+def _find_balanced_json_array(text: str, key: str) -> Optional[str]:
+    marker = f'"{key}":'
+    start = text.find(marker)
+    while start != -1:
+        idx = start + len(marker)
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+        if idx < len(text) and text[idx] == "[":
+            depth = 0
+            in_string = False
+            escaped = False
+            for pos in range(idx, len(text)):
+                ch = text[pos]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                elif ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        return text[idx:pos + 1]
+        start = text.find(marker, start + len(marker))
+    return None
+
+
+def _decode_next_flight_strings(html_text: str) -> list[str]:
+    strings: list[str] = []
+    for match in re.finditer(r"self\.__next_f\.push\(\[1,\"((?:\\.|[^\"\\])*)\"\]\)", html_text):
+        try:
+            strings.append(json.loads(f'"{match.group(1)}"'))
+        except json.JSONDecodeError:
+            continue
+    return strings
+
+
+def _extract_embedded_trades(html_text: str) -> list[dict]:
+    """Extract the table's server-rendered trade rows from a Next.js flight payload."""
+    for chunk in _decode_next_flight_strings(html_text):
+        if '"_txId"' not in chunk or '"data":' not in chunk:
+            continue
+        array_text = _find_balanced_json_array(chunk, "data")
+        if not array_text:
+            continue
+        try:
+            rows = json.loads(array_text)
+        except json.JSONDecodeError:
+            logger.debug("[capitoltrades] failed to parse embedded data array", exc_info=True)
+            continue
+        if rows and isinstance(rows[0], dict) and "_txId" in rows[0]:
+            return rows
+    return []
+
+
+def _fetch_web_page(page: int) -> list[dict]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    params = {"page": page} if page > 1 else None
+    resp = requests.get(CAPITOL_TRADES_WEB_URL, params=params, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return [_normalize_capitol_trade(r) for r in _extract_embedded_trades(unescape(resp.text))]
+
+
+def _fetch_web_pages(max_pages: int = 4) -> list[dict]:
+    trades: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for page in range(1, max_pages + 1):
+        try:
+            rows = _fetch_web_page(page)
+        except Exception as e:
+            logger.error("[capitoltrades:web] page %d failed: %s", page, e)
+            break
+        if not rows:
+            break
+        new_rows = 0
+        for row in rows:
+            tx_id = row.get("ptr_url")
+            if tx_id in seen_ids:
+                continue
+            seen_ids.add(tx_id)
+            trades.append(row)
+            new_rows += 1
+        if new_rows == 0:
+            break
+
+    logger.info("[capitoltrades:web] fetched %d trades across fallback pages", len(trades))
+    return trades
+
+
+def _fetch_bff_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
     """
     Pull recent disclosures from CapitolTrades, sorted newest first.
 
@@ -221,8 +382,8 @@ def _fetch_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
             resp.raise_for_status()
             payload = resp.json()
         except Exception as e:
-            logger.error("[capitoltrades] page %d failed: %s", page, e)
-            break
+            logger.warning("[capitoltrades:bff] page %d failed: %s", page, e)
+            return []
 
         rows = payload.get("data") or []
         if not rows:
@@ -237,8 +398,16 @@ def _fetch_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
         if total_pages and page >= total_pages:
             break
 
-    logger.info("[capitoltrades] fetched %d trades across %d pages", len(trades), last_page_seen)
+    logger.info("[capitoltrades:bff] fetched %d trades across %d pages", len(trades), last_page_seen)
     return trades
+
+
+def _fetch_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
+    trades = _fetch_bff_pages(max_pages=max_pages, page_size=page_size)
+    if trades:
+        return trades
+    logger.info("[capitoltrades] BFF unavailable; falling back to server-rendered pages")
+    return _fetch_web_pages(max_pages=max_pages)
 
 
 def fetch_recent_trades(
@@ -266,7 +435,7 @@ def fetch_recent_trades(
     if basis not in ("disclosure", "transaction"):
         raise ValueError("basis must be 'disclosure' or 'transaction'")
 
-    cutoff     = (datetime.utcnow() - timedelta(days=lookback_days)).date()
+    cutoff     = (datetime.now(UTC) - timedelta(days=lookback_days)).date()
     cutoff_iso = cutoff.strftime("%Y-%m-%d")
     date_field = "disclosure_date" if basis == "disclosure" else "transaction_date"
 

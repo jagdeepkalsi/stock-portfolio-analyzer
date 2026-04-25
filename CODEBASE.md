@@ -363,11 +363,11 @@ render. Pure yfinance (no key).
 
 ## Module: `congress_providers.py`
 
-Normalized adapter for the free House + Senate Stock Watcher S3 JSON feeds.
+Normalized adapter for CapitolTrades House + Senate disclosures.
 
 ```python
-HOUSE_FEED_URL  = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
-SENATE_FEED_URL = "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json"
+CAPITOL_TRADES_URL     = "https://bff.capitoltrades.com/trades"
+CAPITOL_TRADES_WEB_URL = "https://www.capitoltrades.com/trades"
 PRIORITY_MEMBERS = {"pelosi"}  # lowercased substring match
 
 def fetch_recent_trades(lookback_days=7, basis="disclosure") -> dict
@@ -387,9 +387,11 @@ asset, transaction (purchase|sale|exchange|other), raw_type, amount_range,
 amount_min, amount_max, transaction_date, disclosure_date, days_to_disclose,
 ptr_url, is_priority}`.
 
-Caveats: feeds lag actual disclosures by 24-48h; members' party affiliations
-are not in the source — `party` is always None in v1; amount is a range
-(STOCK Act discloses bands, not exact dollars).
+Caveats: disclosures can lag actual trades by days or weeks. The provider tries
+CapitolTrades' BFF JSON endpoint first, then falls back to parsing the
+server-rendered `/trades?page=N` payload if the BFF is blocked or unavailable.
+The fallback uses CapitolTrades' displayed transaction value as the normalized
+amount.
 
 ---
 
