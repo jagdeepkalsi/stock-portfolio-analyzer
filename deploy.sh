@@ -26,9 +26,17 @@ cp market_trends.py build/
 cp congress_providers.py build/
 cp market_digest.py build/
 
-# Install dependencies
-echo "📚 Installing Python dependencies..."
-pip3 install -r requirements-lambda.txt -t build/
+# Install dependencies — force Linux x86_64 wheels so numpy/pandas binaries
+# match the Lambda runtime (otherwise macOS-built wheels fail to import there).
+echo "📚 Installing Python dependencies (linux x86_64 wheels)..."
+pip3 install \
+    --platform manylinux2014_x86_64 \
+    --target build/ \
+    --implementation cp \
+    --python-version 3.11 \
+    --only-binary=:all: \
+    --upgrade \
+    -r requirements-lambda.txt
 
 # Create deployment zip
 echo "🗜️ Creating deployment zip..."
