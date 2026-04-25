@@ -73,10 +73,10 @@ def load_digest_config(portfolio: dict) -> dict:
     return cfg
 
 
-def build_digest(portfolio: dict, cfg: dict) -> dict:
+def build_digest(portfolio: dict, cfg: dict, finnhub_api_key: str) -> dict:
     """Run both data layers and package their results into a single dict."""
     logger.info("Building market trends section...")
-    trends = fetch_market_trends()
+    trends = fetch_market_trends(finnhub_api_key)
 
     logger.info("Building congress section (lookback %dd, basis=%s)...",
                 cfg["congress_lookback_days"], cfg["congress_basis"])
@@ -266,8 +266,10 @@ def render_email_html(digest: dict) -> str:
       {_table(trade_headers, other_rows)}
 
       <p style="color:#999;font-size:12px;margin-top:28px;">
-        Sources: yfinance · house-stock-watcher · senate-stock-watcher.
-        Congressional disclosures typically lag actual trades by weeks. Not investment advice.
+        Sources: Finnhub (market data) · CapitolTrades (congressional disclosures).
+        Macro tape uses ETF proxies (VIXY, IEF, UUP, USO, GLD, IBIT) since Finnhub
+        free tier doesn't include indices/futures. Congressional disclosures typically
+        lag actual trades by weeks. Not investment advice.
       </p>
 
     </div>
@@ -348,7 +350,12 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("market_digest disabled in config; exiting.")
         return 0
 
-    digest = build_digest(portfolio, cfg)
+    finnhub_api_key = os.environ.get("FINNHUB_API_KEY", "")
+    if not finnhub_api_key:
+        logger.error("FINNHUB_API_KEY not set in environment — market trends will be empty.")
+        return 1
+
+    digest = build_digest(portfolio, cfg, finnhub_api_key)
     html   = render_email_html(digest)
 
     if args.dry or not cfg["send_email"]:

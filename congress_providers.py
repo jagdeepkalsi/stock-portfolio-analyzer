@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-Congressional trade data providers.
+Congressional trade data provider — CapitolTrades.com.
 
-Pulls disclosed equity trades for members of the U.S. House and Senate from
-the free, public Stock Watcher S3 JSON feeds:
+Fetches disclosed equity trades for U.S. House and Senate members from
+CapitolTrades' public BFF (backend-for-frontend) JSON API:
 
-  - House:  https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json
-  - Senate: https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json
+  https://bff.capitoltrades.com/trades
 
-Both feeds are built by scraping official STOCK Act PTR filings. There is a
-~24–48 hour lag behind actual disclosures.
+CapitolTrades aggregates official STOCK Act PTR filings from both chambers.
+Disclosures typically lag actual trades by ~24-48 hours plus any reporting
+delay by the member.
 
 Normalized trade dict shape:
 {
   'chamber':         'House' | 'Senate',
   'member':          'Nancy Pelosi',
-  'party':           'D' | 'R' | 'I' | None,         # not in source feeds (v1: None)
+  'party':           'D' | 'R' | 'I' | None,
   'state':           str | None,
-  'district':        str | None,                     # House only
+  'district':        str | None,                     # not on this feed
   'ticker':          str,
-  'asset':           str,                            # long description
+  'asset':           str,                            # company / asset name
   'transaction':     'purchase' | 'sale' | 'exchange' | 'other',
   'raw_type':        original feed string,
   'amount_range':    '$1,001 - $15,000',
@@ -42,65 +42,105 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-HOUSE_FEED_URL  = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
-SENATE_FEED_URL = "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json"
+CAPITOL_TRADES_URL = "https://bff.capitoltrades.com/trades"
+
+# CapitolTrades' BFF rejects requests without a browser-ish User-Agent.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+)
 
 # Names we always flag as priority. Lowercased substring match against member name.
 PRIORITY_MEMBERS = {
     "pelosi",
 }
 
-# Feed "type" strings → normalized transaction bucket
+# Feed "txType" strings → normalized transaction bucket
 _TX_MAP = {
-    "purchase":        "purchase",
-    "p":               "purchase",
-    "sale":            "sale",
-    "sale_full":       "sale",
-    "sale (full)":     "sale",
-    "sale_partial":    "sale",
-    "sale (partial)":  "sale",
-    "s":               "sale",
-    "s (partial)":     "sale",
-    "exchange":        "exchange",
-    "e":               "exchange",
+    "buy":            "purchase",
+    "purchase":       "purchase",
+    "receive":        "purchase",
+    "sell":           "sale",
+    "sale":           "sale",
+    "sell (full)":    "sale",
+    "sell (partial)": "sale",
+    "sale_full":      "sale",
+    "sale_partial":   "sale",
+    "exchange":       "exchange",
 }
 
-# Typical Stock Watcher ranges — parse both "$1,001 - $15,000" and "$1,001 -"
-_AMOUNT_RE = re.compile(r"\$?([\d,]+)(?:\s*-\s*\$?([\d,]+))?")
+# Range patterns we may see in size/sizeRange:
+#   "$1,001 - $15,000"
+#   "1K–15K"   (em-dash)
+#   "15K-50K"
+#   "1M-5M"
+_AMOUNT_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([kKmMbB]?)")
 
 
 def _parse_amount(amount: Optional[str]) -> tuple[float, float]:
-    """Return (min, max) dollar values parsed from a range string. Missing → (0.0, 0.0)."""
+    """Parse a size range like '$1,001 - $15,000' or '15K–50K' into (min, max)."""
     if not amount:
         return 0.0, 0.0
-    m = _AMOUNT_RE.search(amount)
-    if not m:
+    cleaned = amount.replace(",", "").replace("$", "")
+    tokens = _AMOUNT_TOKEN_RE.findall(cleaned)
+    if not tokens:
         return 0.0, 0.0
-    lo = float(m.group(1).replace(",", "")) if m.group(1) else 0.0
-    hi = float(m.group(2).replace(",", "")) if m.group(2) else lo
-    return lo, hi
+
+    def to_dollars(num: str, suffix: str) -> float:
+        try:
+            n = float(num)
+        except ValueError:
+            return 0.0
+        s = suffix.lower()
+        if s == "k":
+            n *= 1_000
+        elif s == "m":
+            n *= 1_000_000
+        elif s == "b":
+            n *= 1_000_000_000
+        return n
+
+    if len(tokens) >= 2:
+        return to_dollars(*tokens[0]), to_dollars(*tokens[1])
+    v = to_dollars(*tokens[0])
+    return v, v
 
 
 def _parse_date(value: Optional[str]) -> Optional[str]:
-    """
-    Feeds use either 'YYYY-MM-DD' or 'MM/DD/YYYY'. Normalize to ISO.
-    Returns None if unparseable.
-    """
+    """Normalize various date formats to ISO 'YYYY-MM-DD'."""
     if not value or not isinstance(value, str):
         return None
     value = value.strip()
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d", "%d/%m/%Y"):
+    # CapitolTrades returns ISO 'YYYY-MM-DD' but tolerate variants for safety.
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ",
+                "%m/%d/%Y", "%Y/%m/%d"):
         try:
-            return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(value[:len(fmt)] if "T" in value and "T" in fmt else value, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
-    return None
+    # Last resort: take the first 10 chars and try ISO again
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 def _normalize_type(value: Optional[str]) -> tuple[str, str]:
     raw = (value or "").strip()
-    key = raw.lower().replace("  ", " ")
-    return _TX_MAP.get(key, "other"), raw
+    return _TX_MAP.get(raw.lower(), "other"), raw
+
+
+def _normalize_party(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    p = value.lower()
+    if "democrat" in p:
+        return "D"
+    if "republican" in p:
+        return "R"
+    if "independent" in p:
+        return "I"
+    return None
 
 
 def _is_priority(member_name: str) -> bool:
@@ -119,114 +159,99 @@ def _days_between(start_iso: Optional[str], end_iso: Optional[str]) -> Optional[
         return None
 
 
-# ---------------------------------------------------------------------------
-# House
-# ---------------------------------------------------------------------------
+def _normalize_trade(row: dict) -> dict:
+    politician = row.get("politician") or {}
+    asset      = row.get("asset") or {}
 
-def _fetch_house() -> list[dict]:
-    logger.info("Fetching House disclosures from Stock Watcher...")
-    try:
-        resp = requests.get(HOUSE_FEED_URL, timeout=30)
-        resp.raise_for_status()
-        raw = resp.json()
-    except Exception as e:
-        logger.error("[house] Failed to fetch feed: %s", e)
-        return []
+    chamber_raw = (politician.get("chamber") or "").lower()
+    chamber     = "Senate" if chamber_raw == "senate" else "House"
 
-    trades = []
-    for row in raw:
-        transaction, raw_type = _normalize_type(row.get("type"))
-        tx_date  = _parse_date(row.get("transaction_date"))
-        dis_date = _parse_date(row.get("disclosure_date"))
-        lo, hi   = _parse_amount(row.get("amount"))
-        member   = (row.get("representative") or "").strip()
-        ticker   = (row.get("ticker") or "").strip().upper() or "—"
+    full_name = (politician.get("fullName") or
+                 f"{politician.get('firstName') or ''} {politician.get('lastName') or ''}".strip())
 
-        trades.append({
-            "chamber":          "House",
-            "member":           member,
-            "party":            None,
-            "state":            (row.get("state") or None),
-            "district":         (row.get("district") or None),
-            "ticker":           ticker,
-            "asset":            (row.get("asset_description") or "").strip(),
-            "transaction":      transaction,
-            "raw_type":         raw_type,
-            "amount_range":     (row.get("amount") or "").strip(),
-            "amount_min":       lo,
-            "amount_max":       hi,
-            "transaction_date": tx_date,
-            "disclosure_date":  dis_date,
-            "days_to_disclose": _days_between(tx_date, dis_date),
-            "ptr_url":          row.get("ptr_link"),
-            "is_priority":      _is_priority(member),
-        })
-    logger.info("[house] Parsed %d trades", len(trades))
+    transaction, raw_type = _normalize_type(row.get("txType") or row.get("txTypeExtended"))
+
+    tx_date  = _parse_date(row.get("txDate"))
+    dis_date = _parse_date(row.get("filingDate") or row.get("pubDate"))
+
+    size_str   = row.get("sizeRange") or row.get("size") or ""
+    lo, hi     = _parse_amount(size_str)
+    ticker     = ((asset.get("assetTicker") or "").strip().upper()) or "—"
+
+    return {
+        "chamber":          chamber,
+        "member":           full_name,
+        "party":            _normalize_party(politician.get("party")),
+        "state":            politician.get("stateId") or politician.get("state"),
+        "district":         None,
+        "ticker":           ticker,
+        "asset":            (asset.get("assetName") or "").strip(),
+        "transaction":      transaction,
+        "raw_type":         raw_type,
+        "amount_range":     size_str,
+        "amount_min":       lo,
+        "amount_max":       hi,
+        "transaction_date": tx_date,
+        "disclosure_date":  dis_date,
+        "days_to_disclose": _days_between(tx_date, dis_date),
+        "ptr_url":          None,
+        "is_priority":      _is_priority(full_name),
+    }
+
+
+def _fetch_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
+    """
+    Pull recent disclosures from CapitolTrades, sorted newest first.
+
+    96 × 4 = ~384 trades, which comfortably covers >7 days at typical volumes.
+    Server-side filters are non-trivial; we sort by -pubDate and slice locally.
+    """
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    trades: list[dict] = []
+    last_page_seen = 0
+
+    for page in range(1, max_pages + 1):
+        try:
+            resp = requests.get(
+                CAPITOL_TRADES_URL,
+                params={"page": page, "pageSize": page_size, "sortBy": "-pubDate"},
+                headers=headers,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            logger.error("[capitoltrades] page %d failed: %s", page, e)
+            break
+
+        rows = payload.get("data") or []
+        if not rows:
+            break
+
+        for r in rows:
+            trades.append(_normalize_trade(r))
+
+        last_page_seen = page
+        meta_paging = (payload.get("meta") or {}).get("paging") or {}
+        total_pages = meta_paging.get("totalPages")
+        if total_pages and page >= total_pages:
+            break
+
+    logger.info("[capitoltrades] fetched %d trades across %d pages", len(trades), last_page_seen)
     return trades
 
-
-# ---------------------------------------------------------------------------
-# Senate
-# ---------------------------------------------------------------------------
-
-def _fetch_senate() -> list[dict]:
-    logger.info("Fetching Senate disclosures from Stock Watcher...")
-    try:
-        resp = requests.get(SENATE_FEED_URL, timeout=30)
-        resp.raise_for_status()
-        raw = resp.json()
-    except Exception as e:
-        logger.error("[senate] Failed to fetch feed: %s", e)
-        return []
-
-    trades = []
-    for row in raw:
-        transaction, raw_type = _normalize_type(row.get("type"))
-        tx_date  = _parse_date(row.get("transaction_date"))
-        dis_date = _parse_date(row.get("disclosure_date"))
-        lo, hi   = _parse_amount(row.get("amount"))
-        member   = (row.get("senator") or "").strip()
-        ticker   = (row.get("ticker") or "").strip().upper() or "—"
-
-        trades.append({
-            "chamber":          "Senate",
-            "member":           member,
-            "party":            None,
-            "state":            None,
-            "district":         None,
-            "ticker":           ticker,
-            "asset":            (row.get("asset_description") or "").strip(),
-            "transaction":      transaction,
-            "raw_type":         raw_type,
-            "amount_range":     (row.get("amount") or "").strip(),
-            "amount_min":       lo,
-            "amount_max":       hi,
-            "transaction_date": tx_date,
-            "disclosure_date":  dis_date,
-            "days_to_disclose": _days_between(tx_date, dis_date),
-            "ptr_url":          row.get("ptr_link"),
-            "is_priority":      _is_priority(member),
-        })
-    logger.info("[senate] Parsed %d trades", len(trades))
-    return trades
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def fetch_recent_trades(
     lookback_days: int = 7,
     basis: str = "disclosure",
 ) -> dict:
     """
-    Fetch and normalize trades from both chambers, filtered to the last N days.
+    Fetch and normalize trades from CapitolTrades, filtered to the last N days.
 
     Args:
         lookback_days: Window size.
-        basis: 'disclosure' (default) filters by disclosure_date — reflects what
-               has newly become public. 'transaction' filters by actual trade date,
-               which can surface older trades disclosed late.
+        basis: 'disclosure' filters by disclosure_date — what newly became public.
+               'transaction' filters by actual trade date — surfaces older trades disclosed late.
 
     Returns:
         {
@@ -241,11 +266,11 @@ def fetch_recent_trades(
     if basis not in ("disclosure", "transaction"):
         raise ValueError("basis must be 'disclosure' or 'transaction'")
 
-    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).date()
+    cutoff     = (datetime.utcnow() - timedelta(days=lookback_days)).date()
     cutoff_iso = cutoff.strftime("%Y-%m-%d")
     date_field = "disclosure_date" if basis == "disclosure" else "transaction_date"
 
-    all_trades = _fetch_house() + _fetch_senate()
+    all_trades = _fetch_pages()
 
     in_window = []
     for t in all_trades:
@@ -258,11 +283,11 @@ def fetch_recent_trades(
         except ValueError:
             continue
 
-    # Priority section: Pelosi first, newest first
+    # Priority section: newest first, then by size
     priority = [t for t in in_window if t["is_priority"]]
     priority.sort(key=lambda t: (t.get(date_field) or "", t.get("amount_max", 0)), reverse=True)
 
-    # Everything else: sorted by trade size (amount_max) desc, then date
+    # Everything else: by size desc, then date
     all_sorted = sorted(
         in_window,
         key=lambda t: (t.get("amount_max", 0), t.get(date_field) or ""),

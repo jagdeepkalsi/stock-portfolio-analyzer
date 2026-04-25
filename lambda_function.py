@@ -831,13 +831,23 @@ class LambdaMarketDigestGenerator:
         self._analyzer.initialize_credentials()
         self._analyzer.load_portfolio_config()
 
+        # Market trends pulls from Finnhub regardless of DATA_PROVIDER, so we
+        # always need the Finnhub key here. initialize_credentials only loads
+        # it when DATA_PROVIDER == 'finnhub'; pull from secrets otherwise.
+        try:
+            api_secrets = self._analyzer.get_secret('portfolio-analyzer/api-keys')
+            self.finnhub_api_key = api_secrets.get('finnhub_api_key') or ''
+        except Exception as e:
+            logger.error(f"Could not retrieve Finnhub API key for market digest: {e}")
+            raise
+
         from market_digest import load_digest_config
         self.digest_cfg = load_digest_config(self._analyzer.portfolio_config)
 
     def run(self) -> dict:
         from market_digest import build_digest, render_email_html
 
-        digest = build_digest(self._analyzer.portfolio_config, self.digest_cfg)
+        digest = build_digest(self._analyzer.portfolio_config, self.digest_cfg, self.finnhub_api_key)
         html   = render_email_html(digest)
 
         if self.digest_cfg.get('send_email', True):
