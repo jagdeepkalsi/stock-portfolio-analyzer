@@ -23,6 +23,7 @@ All providers return the same dict shape from get_stock_data():
 import logging
 import time
 from abc import ABC, abstractmethod
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,24 @@ class StockDataProvider(ABC):
         Fetch quote + company info for a single symbol.
         Returns the standard dict above, or None if the data cannot be fetched.
         """
+
+    def get_performance_snapshots(self, symbol: str) -> dict:
+        """Return 1W/1M percent changes when the provider supports history."""
+        return {'change_1w': None, 'change_1m': None}
+
+
+def _pct_change(closes: list[float], periods: int) -> Optional[float]:
+    """Return % change from N sessions ago to the latest close, or None."""
+    if not closes or len(closes) <= periods:
+        return None
+    try:
+        latest = float(closes[-1])
+        prior = float(closes[-1 - periods])
+        if prior == 0:
+            return None
+        return (latest / prior - 1.0) * 100.0
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +113,19 @@ class YFinanceProvider(StockDataProvider):
         except Exception as e:
             logger.error(f"[yfinance] Error fetching {symbol}: {e}")
             return None
+
+    def get_performance_snapshots(self, symbol: str) -> dict:
+        try:
+            import yfinance as yf
+
+            closes = yf.Ticker(symbol).history(period='2mo', interval='1d')['Close'].dropna().tolist()
+            return {
+                'change_1w': _pct_change(closes, 5),
+                'change_1m': _pct_change(closes, 21),
+            }
+        except Exception as e:
+            logger.warning(f"[yfinance] Could not fetch history for {symbol}: {e}")
+            return super().get_performance_snapshots(symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +212,27 @@ class AlphaVantageProvider(StockDataProvider):
             logger.error(f"[alpha_vantage] Error fetching {symbol}: {e}")
             return None
 
+    def get_performance_snapshots(self, symbol: str) -> dict:
+        try:
+            data = self._get({
+                'function': 'TIME_SERIES_DAILY',
+                'symbol': symbol,
+                'outputsize': 'compact',
+            })
+            series = data.get('Time Series (Daily)', {})
+            closes = [
+                float(row['4. close'])
+                for _, row in sorted(series.items())
+                if row.get('4. close')
+            ]
+            return {
+                'change_1w': _pct_change(closes, 5),
+                'change_1m': _pct_change(closes, 21),
+            }
+        except Exception as e:
+            logger.warning(f"[alpha_vantage] Could not fetch history for {symbol}: {e}")
+            return super().get_performance_snapshots(symbol)
+
 
 # ---------------------------------------------------------------------------
 # Finnhub provider — free tier: 60 req/min, reliable, requires API key
@@ -255,6 +308,28 @@ class FinnhubProvider(StockDataProvider):
         except Exception as e:
             logger.error(f"[finnhub] Error fetching {symbol}: {e}")
             return None
+
+    def get_performance_snapshots(self, symbol: str) -> dict:
+        try:
+            now_ts = int(time.time())
+            sixty_days_ago = now_ts - 60 * 86400
+            candle = self._get('stock/candle', {
+                'symbol': symbol,
+                'resolution': 'D',
+                'from': sixty_days_ago,
+                'to': now_ts,
+            })
+            if not candle or candle.get('s') != 'ok' or not candle.get('c'):
+                return super().get_performance_snapshots(symbol)
+
+            closes = candle['c']
+            return {
+                'change_1w': _pct_change(closes, 5),
+                'change_1m': _pct_change(closes, 21),
+            }
+        except Exception as e:
+            logger.warning(f"[finnhub] Could not fetch history for {symbol}: {e}")
+            return super().get_performance_snapshots(symbol)
 
 
 # ---------------------------------------------------------------------------
