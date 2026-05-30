@@ -1,0 +1,67 @@
+{
+  "themes": [
+    {
+      "name": "AI Platforms and Software",
+      "description": "Application software, data platforms, and infrastructure companies exposed to AI adoption.",
+      "sector_etfs": ["QQQ", "XLK", "IGV", "AIQ"],
+      "symbols": [
+        "MSFT", "GOOGL", "META", "AMZN", "CRM", "NOW", "SNOW", "PLTR", "DDOG", "NET",
+        "MDB", "PATH", "AI", "SOUN", "BBAI", "APP", "U", "ADBE", "ORCL", "TEAM"
+      ]
+    },
+    {
+      "name": "Semiconductors and Compute",
+      "description": "Chip designers, foundries, networking, memory, and semiconductor equipment.",
+      "sector_etfs": ["SMH", "SOXX", "XLK", "QQQ"],
+      "symbols": [
+        "NVDA", "AMD", "AVGO", "MRVL", "TSM", "ASML", "AMAT", "LRCX", "KLAC", "MU",
+        "INTC", "ARM", "QCOM", "ON", "MPWR", "TER", "AEHR", "WOLF", "FORM", "COHR"
+      ]
+    },
+    {
+      "name": "Robotics and Automation",
+      "description": "Industrial automation, autonomous systems, sensors, drones, and robotic process automation.",
+      "sector_etfs": ["BOTZ", "ROBO", "ARKQ", "XLI"],
+      "symbols": [
+        "ISRG", "ROK", "TER", "SYM", "PATH", "IRBT", "ZBRA", "CGNX", "FANUY", "ABBNY",
+        "HLX", "KTOS", "AVAV", "ACHR", "JOBY", "OUST", "LAZR", "AEVA", "SERV", "RR"
+      ]
+    },
+    {
+      "name": "Biotech and Genomics",
+      "description": "Biotech, gene editing, platform therapeutics, and clinical-stage innovation.",
+      "sector_etfs": ["XBI", "IBB", "ARKG", "XLV"],
+      "symbols": [
+        "VRTX", "REGN", "MRNA", "BNTX", "CRSP", "EDIT", "BEAM", "NTLA", "BLUE", "DNA",
+        "RXRX", "SDGR", "EXAS", "NVAX", "SAVA", "IOVA", "MRTX", "HALO", "TECH", "TWST"
+      ]
+    },
+    {
+      "name": "Pharma and Advanced Medicine",
+      "description": "Large pharma, obesity/metabolic platforms, oncology, and specialty medicine.",
+      "sector_etfs": ["XLV", "PPH", "IHE", "IBB"],
+      "symbols": [
+        "LLY", "NVO", "MRK", "PFE", "BMY", "GILD", "AMGN", "ABBV", "JNJ", "AZN",
+        "SNY", "RHHBY", "TAK", "BIIB", "ALNY", "ARGX", "INCY", "IONS", "UTHR", "VKTX"
+      ]
+    },
+    {
+      "name": "Cybersecurity and Trust",
+      "description": "Security software, identity, observability, and network defense.",
+      "sector_etfs": ["CIBR", "HACK", "XLK", "IGV"],
+      "symbols": [
+        "CRWD", "PANW", "ZS", "FTNT", "OKTA", "S", "TENB", "CYBR", "RPD", "QLYS",
+        "NET", "DDOG", "GEN", "CHKP", "VRNS"
+      ]
+    },
+    {
+      "name": "Quantum, Space, and Frontier Compute",
+      "description": "More speculative frontier technology, including quantum, space systems, and advanced compute.",
+      "sector_etfs": ["ARKQ", "QQQ", "XLK", "ITA"],
+      "symbols": [
+        "IONQ", "RGTI", "QBTS", "QUBT", "ARQQ", "RKLB", "ASTS", "LUNR", "PL", "BKSY",
+        "IRDM", "MDAI", "SOUN", "BBAI", "SMR"
+      ]
+    }
+  ]
+}

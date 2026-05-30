@@ -50,6 +50,101 @@ The script will:
 - Display summary in terminal
 - Send email summary if enabled in settings
 
+### Future Upside Watchlist
+
+Generate a local HTML report for future-facing sectors and potential upside trades:
+
+```bash
+python future_upside_report.py --display-limit 50
+```
+
+Outputs are written to `out/future_upside_YYYYMMDD.html`,
+`out/future_upside_YYYYMMDD.json`, and per-company detail pages in
+`out/details/`.
+
+The report scans `future_watchlist.json`, ranks themes such as AI, biotech,
+robotics, pharma, cybersecurity, semiconductors, and frontier compute, then
+scores companies using price range, momentum, relative volume, sector strength,
+and a modeled 45-day call option snapshot. Each company name links to a detail
+page with six-month price history, latest company news, and last-four-quarter
+earnings reaction trends. Add `POLYGON_API_KEY` to `.env` for the strongest
+daily OHLCV history, theme scoring, momentum scoring, detail-page charts, and
+earnings reaction windows. Add `FINNHUB_API_KEY` for company news, earnings
+calendar details, profiles, and quote/profile enrichment.
+
+Recommended setup:
+
+```bash
+echo 'POLYGON_API_KEY=your_key_here' >> .env
+echo 'FINNHUB_API_KEY=your_key_here' >> .env
+python future_upside_report.py --display-limit 50 --market-provider polygon
+```
+
+If Polygon is not configured, the script falls back to Finnhub when
+`FINNHUB_API_KEY` is present, then Yahoo. Finnhub/Yahoo can provide useful
+quotes and metadata, but they may not reliably return the daily candle history
+needed for high-confidence theme rankings.
+
+If Yahoo returns HTTP 429 rate-limit errors, use Finnhub or Polygon:
+
+```bash
+echo 'FINNHUB_API_KEY=your_key_here' >> .env
+python future_upside_report.py --display-limit 50 --market-provider finnhub
+```
+
+For a faster layout-only run without per-company detail pages:
+
+```bash
+python future_upside_report.py --display-limit 50 --market-provider polygon --skip-detail-pages
+```
+
+For a faster data pull while testing, cap the number of watchlist symbols scanned:
+
+```bash
+python future_upside_report.py --scan-limit 25 --display-limit 10 --market-provider polygon
+```
+
+The same report includes a separate congressional watchlist section. Defaults
+track Nancy Pelosi, Josh Gottheimer, Dan Crenshaw, and Ro Khanna:
+
+```bash
+python future_upside_report.py --congress-members "Nancy Pelosi,Josh Gottheimer,Dan Crenshaw,Ro Khanna"
+```
+
+### Hosted Future Upside Report
+
+The AWS stack can also generate and host the Future Upside report as static
+HTML behind CloudFront. The Lambda writes the latest report and a dated archive
+copy into the private portfolio S3 bucket:
+
+```text
+future-upside/latest/index.html
+future-upside/latest/details/SYMBOL.html
+future-upside/archive/YYYY-MM-DD/index.html
+```
+
+Before deploying, update `portfolio-analyzer/api-keys` in AWS Secrets Manager:
+
+```json
+{
+  "alpha_vantage_api_key": "your_alpha_vantage_key",
+  "finnhub_api_key": "your_finnhub_key",
+  "polygon_api_key": "your_polygon_key"
+}
+```
+
+Deploy and invoke:
+
+```bash
+./deploy.sh
+aws lambda invoke --function-name portfolio-future-upside future-response.json
+cat future-response.json
+```
+
+The Lambda response includes `latest_url`, which points at the CloudFront-hosted
+HTML report. The same function is scheduled by EventBridge, and can also be
+invoked manually whenever you want to refresh the page.
+
 ## Configuration Files
 
 ### portfolio.json (Settings)

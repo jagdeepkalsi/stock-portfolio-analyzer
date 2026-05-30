@@ -9,6 +9,7 @@ import os
 import pandas as pd
 from datetime import datetime
 import html as html_lib
+import mimetypes
 import re
 import smtplib
 from email.mime.text import MIMEText
@@ -18,6 +19,7 @@ import boto3
 import logging
 from botocore.exceptions import ClientError
 import io
+from pathlib import Path
 
 from data_providers import get_provider
 
@@ -1159,6 +1161,178 @@ def market_digest_handler(event, context):
             'body': json.dumps({
                 'error':     'Market digest failed',
                 'message':   str(e),
+                'timestamp': start_time.isoformat(),
+            })
+        }
+
+
+# ---------------------------------------------------------------------------
+# Future Upside hosted static report
+# ---------------------------------------------------------------------------
+
+def _s3_content_type(path: Path) -> str:
+    if path.suffix == '.html':
+        return 'text/html; charset=utf-8'
+    if path.suffix == '.json':
+        return 'application/json; charset=utf-8'
+    guessed, _ = mimetypes.guess_type(str(path))
+    return guessed or 'application/octet-stream'
+
+
+class LambdaFutureUpsideReportGenerator:
+    """
+    Generates the Future Upside static report and publishes it to S3.
+    CloudFront serves the uploaded files as a hosted HTML report.
+    """
+
+    def __init__(self):
+        self.s3_client = boto3.client('s3')
+        self.secrets_client = boto3.client('secretsmanager')
+        self.bucket_name = os.environ.get('S3_BUCKET_NAME')
+        self.base_url = os.environ.get('FUTURE_UPSIDE_BASE_URL', '')
+
+    def get_secret(self, secret_name):
+        try:
+            response = self.secrets_client.get_secret_value(SecretId=secret_name)
+            return json.loads(response['SecretString'])
+        except ClientError as e:
+            logger.error(f"Error retrieving secret {secret_name}: {e}")
+            raise
+
+    def initialize(self):
+        if not self.bucket_name:
+            raise ValueError("S3_BUCKET_NAME environment variable not set")
+
+        api_secrets = self.get_secret('portfolio-analyzer/api-keys')
+        polygon_key = api_secrets.get('polygon_api_key') or api_secrets.get('POLYGON_API_KEY')
+        finnhub_key = api_secrets.get('finnhub_api_key') or api_secrets.get('FINNHUB_API_KEY')
+
+        if polygon_key:
+            os.environ['POLYGON_API_KEY'] = polygon_key
+        if finnhub_key:
+            os.environ['FINNHUB_API_KEY'] = finnhub_key
+
+        logger.info(
+            "Future Upside credentials loaded: polygon=%s finnhub=%s",
+            bool(polygon_key),
+            bool(finnhub_key),
+        )
+
+    def run(self, event: dict | None = None) -> dict:
+        event = event or {}
+        from future_upside_report import build_report, write_outputs
+
+        display_limit = int(event.get('display_limit') or event.get('limit') or 50)
+        scan_limit = event.get('scan_limit')
+        scan_limit = int(scan_limit) if scan_limit not in (None, "", "null") else None
+        skip_options = bool(event.get('skip_options', False))
+        skip_detail_pages = bool(event.get('skip_detail_pages', False))
+        pause = float(event.get('pause') or 0.15)
+        market_provider = event.get('market_provider') or 'auto'
+        congress_lookback_days = int(event.get('congress_lookback_days') or 365)
+        congress_members = event.get('congress_members') or [
+            "Nancy Pelosi",
+            "Josh Gottheimer",
+            "Dan Crenshaw",
+            "Ro Khanna",
+        ]
+        if isinstance(congress_members, str):
+            congress_members = [name.strip() for name in congress_members.split(',') if name.strip()]
+
+        out_dir = '/tmp/future-upside'
+        report = build_report(
+            watchlist_path='future_watchlist.json',
+            display_limit=display_limit,
+            scan_limit=scan_limit,
+            skip_options=skip_options,
+            skip_detail_pages=skip_detail_pages,
+            pause=pause,
+            congress_members=congress_members,
+            congress_lookback_days=congress_lookback_days,
+            market_provider=market_provider,
+        )
+        html_path, json_path = write_outputs(report, out_dir)
+        archive_date = datetime.now().strftime('%Y-%m-%d')
+
+        uploaded_keys: list[str] = []
+        root = Path(out_dir)
+        for path in root.rglob('*'):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root).as_posix()
+            body = path.read_bytes()
+            content_type = _s3_content_type(path)
+
+            keys = [
+                f'future-upside/latest/{rel}',
+                f'future-upside/archive/{archive_date}/{rel}',
+            ]
+            if path == html_path:
+                keys.extend([
+                    'future-upside/latest/index.html',
+                    f'future-upside/archive/{archive_date}/index.html',
+                ])
+            if path == json_path:
+                keys.append('future-upside/latest/future_upside.json')
+
+            for key in keys:
+                self.s3_client.put_object(
+                    Bucket=self.bucket_name,
+                    Key=key,
+                    Body=body,
+                    ContentType=content_type,
+                    CacheControl='max-age=60' if '/latest/' in key else 'max-age=31536000, immutable',
+                )
+                uploaded_keys.append(key)
+
+        return {
+            'generated_at': report.get('generated_at'),
+            'display_limit': report.get('display_limit'),
+            'scan_limit': report.get('scan_limit'),
+            'scanned_symbols': report.get('scanned_symbols'),
+            'companies': len(report.get('companies') or []),
+            'latest_url': self.base_url,
+            's3_latest_index': 'future-upside/latest/index.html',
+            's3_archive_index': f'future-upside/archive/{archive_date}/index.html',
+            'uploaded_files': len(set(uploaded_keys)),
+        }
+
+
+def future_upside_handler(event, context):
+    """
+    AWS Lambda handler for the hosted Future Upside report.
+
+    Generates static HTML/JSON/detail pages into /tmp, uploads them to S3 under
+    future-upside/latest/ and future-upside/archive/YYYY-MM-DD/, and returns the
+    CloudFront URL for the latest report.
+    """
+    start_time = datetime.now()
+    logger.info(f"Future Upside handler started at {start_time.isoformat()}")
+
+    try:
+        generator = LambdaFutureUpsideReportGenerator()
+        generator.initialize()
+        result = generator.run(event if isinstance(event, dict) else {})
+
+        execution_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"Future Upside report completed in {execution_time:.2f}s")
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Future Upside report generated successfully',
+                'timestamp': start_time.isoformat(),
+                'execution_time_seconds': execution_time,
+                **result,
+            })
+        }
+
+    except Exception as e:
+        logger.error(f"Future Upside report failed: {str(e)}", exc_info=True)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': 'Future Upside report failed',
+                'message': str(e),
                 'timestamp': start_time.isoformat(),
             })
         }

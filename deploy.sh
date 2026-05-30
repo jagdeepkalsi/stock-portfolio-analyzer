@@ -29,6 +29,8 @@ cp news_alert.py build/
 cp market_trends.py build/
 cp congress_providers.py build/
 cp market_digest.py build/
+cp future_upside_report.py build/
+cp future_watchlist.json build/
 
 # Install dependencies — force Linux x86_64 wheels so numpy/pandas binaries
 # match the Lambda runtime (otherwise macOS-built wheels fail to import there).
@@ -96,11 +98,22 @@ aws lambda wait function-updated \
     --function-name portfolio-market-digest \
     --region $REGION
 
+# Update future upside hosted report Lambda function code
+echo "🔄 Updating future upside Lambda function code..."
+aws lambda update-function-code \
+    --function-name portfolio-future-upside \
+    --s3-bucket $S3_BUCKET \
+    --s3-key lambda-deployment.zip \
+    --region $REGION
+aws lambda wait function-updated \
+    --function-name portfolio-future-upside \
+    --region $REGION
+
 echo "✅ Deployment completed successfully!"
 echo ""
 echo "📋 Next steps:"
 echo "1. Update the secrets in AWS Secrets Manager:"
-echo "   - portfolio-analyzer/api-keys  (add finnhub_api_key)"
+echo "   - portfolio-analyzer/api-keys  (add finnhub_api_key and polygon_api_key)"
 echo "   - portfolio-analyzer/email-config"
 echo "2. Upload your holdings.csv and portfolio.json to S3 bucket"
 echo "3. Enable news alerts in portfolio.json: settings.news_alerts.enabled = true"
@@ -110,6 +123,8 @@ echo "🔗 Useful commands:"
 echo "aws lambda invoke --function-name $FUNCTION_NAME response.json && cat response.json"
 echo "aws lambda invoke --function-name portfolio-news-alert news-response.json && cat news-response.json"
 echo "aws lambda invoke --function-name portfolio-market-digest market-response.json && cat market-response.json"
+echo "aws lambda invoke --function-name portfolio-future-upside future-response.json && cat future-response.json"
 echo "aws logs tail /aws/lambda/$FUNCTION_NAME --follow"
 echo "aws logs tail /aws/lambda/portfolio-news-alert --follow"
 echo "aws logs tail /aws/lambda/portfolio-market-digest --follow"
+echo "aws logs tail /aws/lambda/portfolio-future-upside --follow"

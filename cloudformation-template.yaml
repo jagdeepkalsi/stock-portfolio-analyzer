@@ -267,6 +267,105 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt MarketDigestScheduleRule.Arn
 
+  # Future Upside hosted HTML report — same zip, separate handler + CloudFront URL
+  FutureUpsideFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: portfolio-future-upside
+      Runtime: python3.11
+      Handler: lambda_function.future_upside_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3Key
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref PortfolioBucket
+          FUTURE_UPSIDE_BASE_URL: !Sub "https://${FutureUpsideDistribution.DomainName}/future-upside/latest/index.html"
+      Description: 'Hosted Future Upside static HTML report generator'
+
+  FutureUpsideLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${FutureUpsideFunction}"
+      RetentionInDays: 30
+
+  # EventBridge rule: daily before market open, 6:00 AM Pacific / 9:00 AM Eastern most of the year.
+  FutureUpsideScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger hosted Future Upside report daily"
+      ScheduleExpression: "cron(0 13 * * ? *)"
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt FutureUpsideFunction.Arn
+          Id: "FutureUpsideTarget"
+
+  FutureUpsideInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FutureUpsideFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FutureUpsideScheduleRule.Arn
+
+  FutureUpsideOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-future-upside-oac"
+        Description: "CloudFront access to private Future Upside report files"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FutureUpsideDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} Future Upside hosted report"
+        DefaultRootObject: future-upside/latest/index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        Origins:
+          - Id: FutureUpsideS3Origin
+            DomainName: !GetAtt PortfolioBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FutureUpsideOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: FutureUpsideS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+
+  FutureUpsideBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PortfolioBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadFutureUpsideReports
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${PortfolioBucket}/future-upside/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FutureUpsideDistribution}"
+
 Outputs:
   LambdaFunctionArn:
     Description: "Portfolio Analyzer Lambda Function ARN"
@@ -319,3 +418,21 @@ Outputs:
     Value: !GetAtt MarketDigestScheduleRule.Arn
     Export:
       Name: !Sub "${AWS::StackName}-market-digest-schedule-rule"
+
+  FutureUpsideFunctionArn:
+    Description: "Future Upside Lambda Function ARN"
+    Value: !GetAtt FutureUpsideFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-future-upside-lambda-arn"
+
+  FutureUpsideCloudFrontDomain:
+    Description: "CloudFront domain for hosted Future Upside report"
+    Value: !GetAtt FutureUpsideDistribution.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-future-upside-cloudfront-domain"
+
+  FutureUpsideLatestUrl:
+    Description: "Hosted Future Upside latest report URL"
+    Value: !Sub "https://${FutureUpsideDistribution.DomainName}/future-upside/latest/index.html"
+    Export:
+      Name: !Sub "${AWS::StackName}-future-upside-latest-url"

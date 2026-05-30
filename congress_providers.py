@@ -324,24 +324,28 @@ def _extract_embedded_trades(html_text: str) -> list[dict]:
     return []
 
 
-def _fetch_web_page(page: int) -> list[dict]:
+def _fetch_web_page(page: int, extra_params: Optional[dict] = None) -> list[dict]:
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    params = {"page": page} if page > 1 else None
+    params = dict(extra_params or {})
+    if page > 1:
+        params["page"] = page
+    if not params:
+        params = None
     resp = requests.get(CAPITOL_TRADES_WEB_URL, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
     return [_normalize_capitol_trade(r) for r in _extract_embedded_trades(unescape(resp.text))]
 
 
-def _fetch_web_pages(max_pages: int = 4) -> list[dict]:
+def _fetch_web_pages(max_pages: int = 4, extra_params: Optional[dict] = None) -> list[dict]:
     trades: list[dict] = []
     seen_ids: set[str] = set()
 
     for page in range(1, max_pages + 1):
         try:
-            rows = _fetch_web_page(page)
+            rows = _fetch_web_page(page, extra_params=extra_params)
         except Exception as e:
             logger.error("[capitoltrades:web] page %d failed: %s", page, e)
             break
@@ -362,7 +366,7 @@ def _fetch_web_pages(max_pages: int = 4) -> list[dict]:
     return trades
 
 
-def _fetch_bff_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
+def _fetch_bff_pages(max_pages: int = 4, page_size: int = 96, extra_params: Optional[dict] = None) -> list[dict]:
     """
     Pull recent disclosures from CapitolTrades, sorted newest first.
 
@@ -375,9 +379,11 @@ def _fetch_bff_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
 
     for page in range(1, max_pages + 1):
         try:
+            params = {"page": page, "pageSize": page_size, "sortBy": "-pubDate"}
+            params.update(extra_params or {})
             resp = requests.get(
                 CAPITOL_TRADES_URL,
-                params={"page": page, "pageSize": page_size, "sortBy": "-pubDate"},
+                params=params,
                 headers=headers,
                 timeout=30,
             )
@@ -404,12 +410,12 @@ def _fetch_bff_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
     return trades
 
 
-def _fetch_pages(max_pages: int = 4, page_size: int = 96) -> list[dict]:
-    trades = _fetch_bff_pages(max_pages=max_pages, page_size=page_size)
+def _fetch_pages(max_pages: int = 4, page_size: int = 96, extra_params: Optional[dict] = None) -> list[dict]:
+    trades = _fetch_bff_pages(max_pages=max_pages, page_size=page_size, extra_params=extra_params)
     if trades:
         return trades
     logger.info("[capitoltrades] BFF unavailable; falling back to server-rendered pages")
-    return _fetch_web_pages(max_pages=max_pages)
+    return _fetch_web_pages(max_pages=max_pages, extra_params=extra_params)
 
 
 def fetch_recent_trades(
@@ -479,6 +485,62 @@ def fetch_recent_trades(
         "counts":          counts,
         "priority_trades": priority,
         "all_trades":      all_sorted,
+    }
+
+
+def fetch_member_trades(
+    politician_id: str,
+    lookback_days: int = 1095,
+    basis: str = "disclosure",
+    max_pages: int = 10,
+) -> dict:
+    """Fetch trade history for one CapitolTrades politician id."""
+    if basis not in ("disclosure", "transaction"):
+        raise ValueError("basis must be 'disclosure' or 'transaction'")
+    if not politician_id:
+        return {
+            "lookback_days": lookback_days,
+            "basis": basis,
+            "cutoff_date": "",
+            "counts": {"house": 0, "senate": 0, "priority": 0, "total": 0},
+            "priority_trades": [],
+            "all_trades": [],
+        }
+
+    cutoff = (datetime.now(UTC) - timedelta(days=lookback_days)).date()
+    cutoff_iso = cutoff.strftime("%Y-%m-%d")
+    date_field = "disclosure_date" if basis == "disclosure" else "transaction_date"
+    all_trades = _fetch_pages(max_pages=max_pages, extra_params={"politician": politician_id})
+
+    in_window = []
+    for trade in all_trades:
+        d = trade.get(date_field)
+        if not d:
+            continue
+        try:
+            if datetime.strptime(d, "%Y-%m-%d").date() >= cutoff:
+                in_window.append(trade)
+        except ValueError:
+            continue
+
+    all_sorted = sorted(
+        in_window,
+        key=lambda t: (t.get(date_field) or "", t.get("amount_max", 0)),
+        reverse=True,
+    )
+    priority = [t for t in all_sorted if t["is_priority"]]
+    return {
+        "lookback_days": lookback_days,
+        "basis": basis,
+        "cutoff_date": cutoff_iso,
+        "counts": {
+            "house": sum(1 for t in in_window if t["chamber"] == "House"),
+            "senate": sum(1 for t in in_window if t["chamber"] == "Senate"),
+            "priority": len(priority),
+            "total": len(in_window),
+        },
+        "priority_trades": priority,
+        "all_trades": all_sorted,
     }
 
 
