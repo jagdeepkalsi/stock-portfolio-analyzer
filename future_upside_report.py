@@ -29,6 +29,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -70,6 +71,7 @@ HTTP_HEADERS = {
     )
 }
 ACTIVE_MARKET_PROVIDER = "auto"
+REPORT_TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 
 class MarketDataError(RuntimeError):
@@ -1444,10 +1446,10 @@ def build_report(
             company_details.append(detail)
             time.sleep(pause)
 
-    now = datetime.now()
+    now = datetime.now(REPORT_TIMEZONE)
     return {
         "generated_at": now.isoformat(),
-        "generated_at_display": now.strftime("%B %d, %Y %I:%M %p"),
+        "generated_at_display": now.strftime("%B %d, %Y %I:%M %p %Z"),
         "watchlist_path": watchlist_path,
         "total_symbols": total_symbols,
         "scanned_symbols": len(universe_items),
@@ -1691,6 +1693,21 @@ def render_html(report: dict) -> str:
     }}
     h1 {{ margin: 0; font-size: 26px; letter-spacing: 0; }}
     header p {{ margin: 6px 0 0; color: #c7d2fe; }}
+    .header-meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }}
+    .header-meta span {{
+      border: 1px solid rgba(199, 210, 254, .35);
+      border-radius: 999px;
+      padding: 4px 10px;
+      color: #e0e7ff;
+      background: rgba(255, 255, 255, .08);
+      font-size: 12px;
+      white-space: nowrap;
+    }}
     section {{
       background: var(--panel);
       border: 1px solid var(--line);
@@ -1860,7 +1877,12 @@ def render_html(report: dict) -> str:
   <div class="wrap">
     <header>
       <h1>Future Upside Watchlist</h1>
-      <p>{report["generated_at_display"]} - scanned {report["scanned_symbols"]} of {report.get("total_symbols", report["scanned_symbols"])} symbols, showing top {len(report["companies"])}</p>
+      <p>Generated {report["generated_at_display"]}</p>
+      <div class="header-meta">
+        <span>Scanned {report["scanned_symbols"]} of {report.get("total_symbols", report["scanned_symbols"])} symbols</span>
+        <span>Showing top {len(report["companies"])}</span>
+        <span>Provider {ACTIVE_MARKET_PROVIDER}</span>
+      </div>
     </header>
 
     <section>
