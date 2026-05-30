@@ -1384,9 +1384,20 @@ def build_company_detail(company: CompanyScore, pause: float = 0.15) -> dict[str
     }
 
 
+def parse_display_limit(value: Any, default: int | None = 50) -> int | None:
+    if value is None or value == "":
+        return default
+    if isinstance(value, str) and value.strip().lower() in {"all", "none", "null", "*"}:
+        return None
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError("display limit must be at least 1, or 'all'")
+    return parsed
+
+
 def build_report(
     watchlist_path: str,
-    display_limit: int,
+    display_limit: int | None,
     scan_limit: int | None,
     skip_options: bool,
     skip_detail_pages: bool,
@@ -1422,7 +1433,7 @@ def build_report(
         time.sleep(pause)
 
     companies.sort(key=lambda r: r.score, reverse=True)
-    top_companies = companies[:display_limit]
+    top_companies = companies if display_limit is None else companies[:display_limit]
 
     if not skip_options:
         logger.info("Fetching option snapshots for top %d...", len(top_companies))
@@ -1454,8 +1465,8 @@ def build_report(
         "total_symbols": total_symbols,
         "scanned_symbols": len(universe_items),
         "scan_limit": scan_limit,
-        "display_limit": display_limit,
-        "limit": display_limit,
+        "display_limit": display_limit if display_limit is not None else "all",
+        "limit": display_limit if display_limit is not None else "all",
         "themes": [asdict(theme) for theme in themes],
         "companies": [asdict(company) for company in top_companies],
         "company_details": company_details,
@@ -1637,6 +1648,11 @@ def _render_congress_section(congress: dict) -> str:
 
 
 def render_html(report: dict) -> str:
+    showing_label = (
+        f"Showing all {len(report['companies'])}"
+        if report.get("display_limit") == "all"
+        else f"Showing top {len(report['companies'])}"
+    )
     theme_cards = "\n".join(_theme_card(theme) for theme in report["themes"])
     detail_paths = {
         detail["symbol"]: detail.get("detail_path")
@@ -1880,7 +1896,7 @@ def render_html(report: dict) -> str:
       <p>Generated {report["generated_at_display"]}</p>
       <div class="header-meta">
         <span>Scanned {report["scanned_symbols"]} of {report.get("total_symbols", report["scanned_symbols"])} symbols</span>
-        <span>Showing top {len(report["companies"])}</span>
+        <span>{showing_label}</span>
         <span>Provider {ACTIVE_MARKET_PROVIDER}</span>
       </div>
     </header>
@@ -2229,9 +2245,9 @@ def main(argv: list[str] | None = None) -> int:
         "--display-limit",
         "--limit",
         dest="display_limit",
-        type=int,
+        type=parse_display_limit,
         default=50,
-        help="Number of ranked companies to show. --limit is kept as a backward-compatible alias.",
+        help="Number of ranked companies to show, or 'all'. --limit is kept as a backward-compatible alias.",
     )
     parser.add_argument(
         "--scan-limit",
@@ -2262,8 +2278,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.display_limit < 1:
-        raise SystemExit("--display-limit must be at least 1")
     if args.scan_limit is not None and args.scan_limit < 1:
         raise SystemExit("--scan-limit must be at least 1")
 

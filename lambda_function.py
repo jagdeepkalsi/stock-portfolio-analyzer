@@ -1220,9 +1220,9 @@ class LambdaFutureUpsideReportGenerator:
 
     def run(self, event: dict | None = None) -> dict:
         event = event or {}
-        from future_upside_report import build_report, write_outputs
+        from future_upside_report import build_report, parse_display_limit, write_outputs
 
-        display_limit = int(event.get('display_limit') or event.get('limit') or 50)
+        display_limit = parse_display_limit(event.get('display_limit', event.get('limit')), default=50)
         scan_limit = event.get('scan_limit')
         scan_limit = int(scan_limit) if scan_limit not in (None, "", "null") else None
         skip_options = bool(event.get('skip_options', False))
